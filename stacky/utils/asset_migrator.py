@@ -378,7 +378,8 @@ class LegacyMigrationDialog(QDialog):
         super().__init__(parent)
         self.window_manager = window_manager
         self.setWindowTitle("旧版桌面工具资产迁移与协同管理")
-        self.setFixedSize(560, 620)
+        self.setMinimumSize(620, 660)
+        self.resize(660, 760)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
@@ -436,7 +437,7 @@ class LegacyMigrationDialog(QDialog):
             padding: 4px;
         }
         QListWidget::item {
-            padding: 6px;
+            padding: 8px 6px;
             border-bottom: 1px solid rgba(255, 255, 255, 10);
             border-radius: 6px;
         }
@@ -461,16 +462,18 @@ class LegacyMigrationDialog(QDialog):
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(14)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(18)
 
         # 1. Header
         header_layout = QVBoxLayout()
-        header_layout.setSpacing(4)
+        header_layout.setSpacing(6)
         title = QLabel("旧版桌面工具物理资产无损迁移与平滑交接")
+        title.setWordWrap(True)
         title.setFont(QFont("Segoe UI Variable Display", 16, QFont.Weight.Bold))
         title.setStyleSheet("color: #ffffff;")
-        subtitle = QLabel("物理目录 100% 零修改零风险 · 双向实时热同步 · 智能网格排列上屏")
+        subtitle = QLabel("物理目录零修改、零风险，双向实时同步，按网格排列上屏")
+        subtitle.setWordWrap(True)
         subtitle.setFont(QFont("Segoe UI", 11))
         subtitle.setStyleSheet("color: #a0aec0;")
         header_layout.addWidget(title)
@@ -479,17 +482,19 @@ class LegacyMigrationDialog(QDialog):
 
         # 2. Status Box
         self.status_frame = QFrame()
+        self.status_frame.setObjectName("statusFrame")
+        # 选择器必须限定到 #statusFrame：QLabel 继承 QFrame，
+        # 写成 QFrame 会把里面每一行文字都画成独立边框盒。
         self.status_frame.setStyleSheet("""
-        QFrame {
+        QFrame#statusFrame {
             background-color: rgba(30, 34, 48, 0.85);
             border: 1px solid rgba(255, 255, 255, 30);
             border-radius: 10px;
-            padding: 10px;
         }
         """)
         status_layout = QVBoxLayout(self.status_frame)
-        status_layout.setContentsMargins(12, 10, 12, 10)
-        status_layout.setSpacing(6)
+        status_layout.setContentsMargins(16, 14, 16, 14)
+        status_layout.setSpacing(9)
 
         self.lbl_install = QLabel()
         self.lbl_proc = QLabel()
@@ -498,6 +503,7 @@ class LegacyMigrationDialog(QDialog):
 
         for lbl in [self.lbl_install, self.lbl_proc, self.lbl_storage, self.lbl_autostart]:
             lbl.setFont(QFont("Segoe UI", 10))
+            lbl.setWordWrap(True)
             status_layout.addWidget(lbl)
         layout.addWidget(self.status_frame)
 
@@ -517,10 +523,12 @@ class LegacyMigrationDialog(QDialog):
 
         # 4. Category List Widget
         self.list_widget = QListWidget()
+        self.list_widget.setMinimumHeight(200)
+        self.list_widget.setSpacing(2)
         layout.addWidget(self.list_widget, 1)
 
         # 5. One-Click Matrix Button
-        self.btn_create_matrix = QPushButton("🚀 一键生成桌面大文件夹卡片 (16px 磁吸网格排列)")
+        self.btn_create_matrix = QPushButton("一键生成桌面卡片（16px 网格排列）")
         self.btn_create_matrix.setObjectName("primaryBtn")
         self.btn_create_matrix.setFixedHeight(40)
         self.btn_create_matrix.clicked.connect(self.action_create_matrix)
@@ -530,29 +538,30 @@ class LegacyMigrationDialog(QDialog):
         action_bar = QHBoxLayout()
         action_bar.setSpacing(10)
 
-        self.btn_stop_proc = QPushButton("🛑 退出旧版程序进程")
+        self.btn_stop_proc = QPushButton("退出旧版程序进程")
         self.btn_stop_proc.setObjectName("dangerBtn")
-        self.btn_stop_proc.setFixedHeight(34)
+        self.btn_stop_proc.setFixedHeight(36)
         self.btn_stop_proc.clicked.connect(self.action_stop_legacy)
         action_bar.addWidget(self.btn_stop_proc)
 
-        self.btn_toggle_autostart = QPushButton("🔄 切换开机自启动接管")
-        self.btn_toggle_autostart.setFixedHeight(34)
+        self.btn_toggle_autostart = QPushButton("切换开机自启动")
+        self.btn_toggle_autostart.setFixedHeight(36)
         self.btn_toggle_autostart.clicked.connect(self.action_switch_autostart)
         action_bar.addWidget(self.btn_toggle_autostart)
 
-        btn_open_storage = QPushButton("📂 打开物理存储")
-        btn_open_storage.setFixedHeight(34)
+        btn_open_storage = QPushButton("打开物理存储")
+        btn_open_storage.setFixedHeight(36)
         btn_open_storage.clicked.connect(self.action_open_storage)
         action_bar.addWidget(btn_open_storage)
 
         layout.addLayout(action_bar)
 
         # 7. Safe Promise Footer
-        footer = QLabel("🛡️ 绝对安全承诺：所有文件与快捷方式始终保存在旧版程序原物理目录，大文件夹直接挂载该目录，无任何重命名、迁移或数据损失，随时可双向互切。")
+        footer = QLabel("安全承诺：所有文件与快捷方式始终保存在旧版程序的原物理目录，大文件夹直接挂载该目录，"
+                        "不做重命名或迁移，随时可以双向切换。")
         footer.setWordWrap(True)
         footer.setFont(QFont("Segoe UI", 9))
-        footer.setStyleSheet("color: #718096; line-height: 1.4;")
+        footer.setStyleSheet("color: #718096; line-height: 1.5;")
         layout.addWidget(footer)
 
     def refresh_data(self):
@@ -560,24 +569,25 @@ class LegacyMigrationDialog(QDialog):
         self.env = detect_legacy_environment(self.window_manager)
 
         # Status text
-        inst_text = "已安装: " + self.env["exe_path"] if self.env["installed"] else "未检测到已安装的旧版程序"
-        self.lbl_install.setText(f"🖥️ <b>程序状态:</b> {inst_text}")
+        inst_text = "已安装：" + self.env["exe_path"] if self.env["installed"] else "未检测到已安装的旧版程序"
+        self.lbl_install.setText(f"<b>程序状态：</b>{inst_text}")
 
         if self.env["running"]:
             pids = ", ".join(str(p["pid"]) for p in self.env["processes"])
-            self.lbl_proc.setText(f"⚡ <b>进程状态:</b> <span style='color: #48bb78;'>运行中</span> (PID: {pids})")
+            self.lbl_proc.setText(f"<b>进程状态：</b><span style='color: #48bb78;'>运行中</span>（PID: {pids}）")
             self.btn_stop_proc.setEnabled(True)
-            self.btn_stop_proc.setText("🛑 安全退出旧版程序进程")
+            self.btn_stop_proc.setText("安全退出旧版程序进程")
         else:
-            self.lbl_proc.setText("⚡ <b>进程状态:</b> <span style='color: #a0aec0;'>未运行 (已安全交接)</span>")
+            self.lbl_proc.setText("<b>进程状态：</b><span style='color: #a0aec0;'>未运行（已安全交接）</span>")
             self.btn_stop_proc.setEnabled(False)
             self.btn_stop_proc.setText("旧版程序已退出")
 
-        self.lbl_storage.setText(f"📁 <b>物理存储:</b> {self.env['storage_root']} (共 {len(self.env['categories'])} 个分类)")
+        self.lbl_storage.setText(f"<b>物理存储：</b>{self.env['storage_root']}"
+                                 f"（共 {len(self.env['categories'])} 个分类）")
 
         auto_d = "开机自启" if self.env["autostart_legacy"] else "未自启"
         auto_b = "开机自启" if self.env["autostart_bigfolder"] else "未自启"
-        self.lbl_autostart.setText(f"⚙️ <b>开机交接:</b> 旧版程序 [{auto_d}] · 大文件夹 [{auto_b}]")
+        self.lbl_autostart.setText(f"<b>开机交接：</b>旧版程序 [{auto_d}] · 大文件夹 [{auto_b}]")
 
         # Populate Category List
         self.list_widget.clear()

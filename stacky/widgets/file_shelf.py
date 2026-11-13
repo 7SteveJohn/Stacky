@@ -543,7 +543,7 @@ class FileShelfWindow(QWidget):
         bottom_box.setSpacing(8)
 
         # Main "Drag All" button
-        self.btn_drag_all = QPushButton("⇪ 全部拖出 (按住拖拽至目标窗口)", self.expanded_container)
+        self.btn_drag_all = QPushButton("全部拖出（按住拖拽至目标窗口）", self.expanded_container)
         self.btn_drag_all.setFixedHeight(34)
         self.btn_drag_all.setCursor(Qt.CursorShape.OpenHandCursor)
         self.btn_drag_all.setToolTip("按住此按钮拖拽，可一次性将所有暂存文件拖入微信、邮件、浏览器或文件夹")

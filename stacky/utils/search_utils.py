@@ -244,10 +244,10 @@ def parse_web_quick_link(query: str) -> Optional[Dict[str, Any]]:
 
     # Prefix search table: (prefix, name, home_url, search_prefix, icon)
     prefixes = [
-        ("gh", "GitHub", "https://github.com", "https://github.com/search?q=", "🐙"),
-        ("bili", "哔哩哔哩", "https://www.bilibili.com", "https://search.bilibili.com/all?keyword=", "📺"),
-        ("bd", "百度", "https://www.baidu.com", "https://www.baidu.com/s?wd=", "🔍"),
-        ("g", "Google", "https://www.google.com", "https://www.google.com/search?q=", "🌐"),
+        ("gh", "GitHub", "https://github.com", "https://github.com/search?q=", "GH"),
+        ("bili", "哔哩哔哩", "https://www.bilibili.com", "https://search.bilibili.com/all?keyword=", "B"),
+        ("bd", "百度", "https://www.baidu.com", "https://www.baidu.com/s?wd=", "百"),
+        ("g", "Google", "https://www.google.com", "https://www.google.com/search?q=", "G"),
     ]
 
     for pfx, name, home_url, search_prefix, icon in prefixes:
@@ -286,7 +286,7 @@ def parse_web_quick_link(query: str) -> Optional[Dict[str, Any]]:
             "url": q,
             "prefix": "url",
             "query": q,
-            "icon": "🌐",
+            "icon": "网",
         }
 
     # Common domain matching: *.com, *.cn, *.org, *.net, *.io, etc. (with optional port & path)
@@ -299,7 +299,7 @@ def parse_web_quick_link(query: str) -> Optional[Dict[str, Any]]:
                 "url": target_url,
                 "prefix": "url",
                 "query": q,
-                "icon": "🌐",
+                "icon": "网",
             }
 
         # Direct IPv4 address matching (e.g. 127.0.0.1:8080 or 192.168.1.1)
@@ -311,7 +311,7 @@ def parse_web_quick_link(query: str) -> Optional[Dict[str, Any]]:
                 "url": target_url,
                 "prefix": "url",
                 "query": q,
-                "icon": "🌐",
+                "icon": "网",
             }
 
     return None
@@ -326,42 +326,42 @@ SYSTEM_COMMANDS: List[Dict[str, Any]] = [
     {
         "id": "cmd",
         "name": "命令提示符 (CMD)",
-        "icon": "💻",
+        "icon": ">",
         "keywords": ["cmd", "terminal", "command", "ml", "mingling", "powershell", "pwsh"],
         "cmd": "cmd.exe /c start cmd",
     },
     {
         "id": "taskmgr",
         "name": "任务管理器 (Task Manager)",
-        "icon": "⚡",
+        "icon": "T",
         "keywords": ["taskmgr", "rwgl", "task", "renwuguanliqi"],
         "cmd": "taskmgr.exe",
     },
     {
         "id": "calc",
         "name": "系统计算器 (Calculator)",
-        "icon": "🧮",
+        "icon": "=",
         "keywords": ["calc", "jsq", "calculator", "jisuanqi"],
         "cmd": "calc.exe",
     },
     {
         "id": "regedit",
         "name": "注册表编辑器 (Registry Editor)",
-        "icon": "🛠️",
+        "icon": "R",
         "keywords": ["regedit", "reg", "zcb", "zhucebiao"],
         "cmd": "regedit.exe",
     },
     {
         "id": "control",
         "name": "控制面板 (Control Panel)",
-        "icon": "⚙️",
+        "icon": "C",
         "keywords": ["control", "kzmb", "panel", "kongzhimianban"],
         "cmd": "control.exe",
     },
     {
         "id": "lock",
         "name": "锁定屏幕 (Lock Workstation)",
-        "icon": "🔒",
+        "icon": "L",
         "keywords": ["lock", "suoping", "sp", "suo", "suoding"],
         "action": "lock_workstation",
     },

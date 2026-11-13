@@ -614,7 +614,7 @@ class MobileExpandedItemWidget(QWidget):
 
         act_none = sg_menu.addAction("全部")
         if not curr_sg:
-            act_none.setText("✓ 全部 / 默认 (无子分组)")
+            act_none.setText("全部 / 默认（无子分组）")
         act_none.triggered.connect(lambda: self.action_assign_subgroup(""))
 
         known_sgs = []
@@ -627,7 +627,7 @@ class MobileExpandedItemWidget(QWidget):
             for s in known_sgs:
                 if not s or s == "全部":
                     continue
-                label = f"✓ {s}" if s == curr_sg else s
+                label = f"· {s}" if s == curr_sg else s
                 act_s = sg_menu.addAction(label)
                 act_s.triggered.connect(lambda checked=False, target_sg=s: self.action_assign_subgroup(target_sg))
 
@@ -730,9 +730,9 @@ class SearchBannerWidget(QWidget):
     """
     Raycast / Spotlight style result banner widget:
     - 46px height with continuous curvature squircle boundary
-    - High-contrast icon badge (🧮, 🌐, 🐙, 📺, ⚡, 💻, 🔒, etc.)
+    - High-contrast monochrome icon badge
     - Crisp primary typography with elision
-    - 'Enter ↵' keyboard action tag on the far right
+    - 'Enter' keyboard action tag on the far right
     - Selection and hover tactile animations
     """
     clicked = Signal(dict)
@@ -823,7 +823,7 @@ class SearchBannerWidget(QWidget):
 
         # 2. Icon / Badge on the left
         icon_str = self.item_data.get("icon", "")
-        if not icon_str or icon_str == "🔍":
+        if not icon_str:
             # Sleek monochromatic vector magnifying glass badge
             pen = QPen(QColor(100, 180, 255), 1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -837,7 +837,8 @@ class SearchBannerWidget(QWidget):
             p_end = QPoint(int(p_start.x() + 4.8), int(p_start.y() + 4.8))
             painter.drawLine(p_start, p_end)
         else:
-            font_icon = QFont("Segoe UI Emoji", 14)
+            font_icon = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
+            font_icon.setFamilies(["Segoe UI", "Microsoft YaHei UI", "PingFang SC"])
             painter.setFont(font_icon)
             painter.setPen(QColor(255, 255, 255))
             painter.drawText(QRectF(14, 0, 28, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, icon_str)
@@ -857,7 +858,7 @@ class SearchBannerWidget(QWidget):
         font_badge = QFont("Segoe UI Variable Display", 9, QFont.Weight.Medium)
         painter.setFont(font_badge)
         painter.setPen(QColor(255, 255, 255, 220))
-        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "Enter ↵")
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "Enter")
 
         # 4. Main title text
         title_text = self.item_data.get("name", "")
@@ -1117,7 +1118,7 @@ class SearchFileBannerWidget(QWidget):
         menu.addSeparator()
         overlay = self.window()
         folder_title = getattr(overlay, "folder_name", "当前大文件夹")
-        act_add_to_folder = menu.addAction(f"➕ 添加到【{folder_title}】文件夹")
+        act_add_to_folder = menu.addAction(f"添加到【{folder_title}】文件夹")
         if hasattr(overlay, "action_add_file_to_folder"):
             act_add_to_folder.triggered.connect(lambda: overlay.action_add_file_to_folder(self.item_data))
 
@@ -1560,7 +1561,7 @@ class HeroExpandedFolderOverlay(QWidget):
     - Smooth fluid expansion from the desktop folder card's exact physical coordinates (start_geo).
     - QVariantAnimation with OutBack easing for authentic spring bounce.
     - Reversible collapse animation back into origin on dismiss.
-    - Dismissable via Esc, clicking on the scrim outside the card, clicking close button '✕', or launching an app.
+    - Dismissable via Esc, clicking on the scrim outside the card, clicking close button, or launching an app.
     - Inline editable folder title, live pinyin search, spacious 4-column squircle grid, system-level context menus.
     """
     folder_renamed = Signal(str)
@@ -2283,7 +2284,7 @@ class HeroExpandedFolderOverlay(QWidget):
                     "name": f"计算结果: {math_res['formatted']} (按回车复制到剪贴板)",
                     "value": math_res["formatted"],
                     "raw_val": math_res["raw_val"],
-                    "icon": "🧮",
+                    "icon": "=",
                 })
 
             # 2. Web Search & Quick Links
@@ -2293,7 +2294,7 @@ class HeroExpandedFolderOverlay(QWidget):
                     "type": "web",
                     "name": f"{web_res['title']} (按回车直接打开)",
                     "url": web_res["url"],
-                    "icon": web_res.get("icon", "🌐"),
+                    "icon": web_res.get("icon", "网"),
                 })
 
             # 3. Filtered Local Apps within active subgroup
@@ -2313,7 +2314,7 @@ class HeroExpandedFolderOverlay(QWidget):
                         "type": "sys_cmd",
                         "name": f"{sc['name']} (按回车执行)",
                         "cmd_info": sc,
-                        "icon": sc.get("icon", "⚡"),
+                        "icon": sc.get("icon", ">"),
                     })
 
             # 5. Everything 全盘毫秒检索 (P3 级，当键入字符 >= 2 时流式呈现)

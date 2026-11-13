@@ -840,7 +840,7 @@ class AppSlotWidget(QWidget):
 
         act_none = sg_menu.addAction("全部")
         if not curr_sg:
-            act_none.setText("✓ 全部 / 默认 (无子分组)")
+            act_none.setText("全部 / 默认（无子分组）")
         act_none.triggered.connect(lambda: self.action_assign_subgroup(""))
 
         known_sgs = []
@@ -853,7 +853,7 @@ class AppSlotWidget(QWidget):
             for s in known_sgs:
                 if not s or s == "全部":
                     continue
-                label = f"✓ {s}" if s == curr_sg else s
+                label = f"· {s}" if s == curr_sg else s
                 act_s = sg_menu.addAction(label)
                 act_s.triggered.connect(lambda checked=False, target_sg=s: self.action_assign_subgroup(target_sg))
 
