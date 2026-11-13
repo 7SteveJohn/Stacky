@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import ConfigManager
+from ui_kit import theme_pick
 from acrylic_utils import apply_blur, remove_blur
 from widgets import BigFolderCard, FolderTitleLabel, AppSlotWidget
 from icon_utils import (
@@ -524,8 +525,10 @@ class BigFolderWindow(QWidget):
             hint = QLabel("空分类\n把应用拖进来，或右键「整理图标」", self.card)
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hint.setWordWrap(True)
+            hint_color = theme_pick(self.config_manager.get("theme", "dark"),
+                                   "rgba(15,23,42,0.62)", "rgba(255,255,255,0.45)")
             hint.setStyleSheet(
-                "color: rgba(255,255,255,0.45); font-size: 12px; background: transparent;")
+                f"color: {hint_color}; font-size: 12px; background: transparent;")
             self.card_layout.addWidget(hint, 0, 0, max(1, rows), max(1, cols))
             self._empty_hint = hint
 

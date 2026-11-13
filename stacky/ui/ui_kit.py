@@ -4,7 +4,7 @@
 对话框与弹窗（城市选择、输入对话框、文件对话框按钮等）。
 """
 from PySide6.QtCore import Qt, QRectF, QTimer
-from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette, QPen, QPainterPath
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QRadioButton
 
 
@@ -109,6 +109,103 @@ QCheckBox::indicator:checked, QRadioButton::indicator:checked {
 }
 QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: #a9aeb5; }
 """
+
+# 这些对话框不自绘底色，背景取自系统调色板。GLOBAL_QSS 却把它们的标签与按钮
+# 前景写死成浅色，系统切浅色后就成了白底白字，必须整套指定背景+前景。
+_NATIVE_DIALOGS = ("QMessageBox", "QInputDialog", "QProgressDialog", "QErrorMessage")
+
+
+def _scoped(selector: str) -> str:
+    """限定在原生对话框内部，避免改动应用自己窗口里的同类型控件。"""
+    return ", ".join(f"{d} {selector}" for d in _NATIVE_DIALOGS)
+
+
+def native_dialog_qss(light: bool) -> str:
+    if light:
+        bg, fg = "#f7f8fa", "#1b2029"
+        btn_bg, btn_hover, border = "#e7eaf0", "#d9dee7", "#c5ccd8"
+        field_bg, muted = "#ffffff", "#5c6472"
+    else:
+        bg, fg = "#1c1e26", "#eef0f4"
+        btn_bg, btn_hover, border = "#2c303b", "#3a4050", "#454b59"
+        field_bg, muted = "#23262f", "#aeb4bf"
+
+    windows = ", ".join(_NATIVE_DIALOGS)
+    fields = ", ".join(f"{d} {w}" for d in _NATIVE_DIALOGS for w in ("QLineEdit", "QComboBox"))
+    return f"""
+{windows} {{ background-color: {bg}; color: {fg}; }}
+{_scoped('QLabel')} {{ color: {fg}; background: transparent; }}
+{_scoped('QPushButton')} {{
+    background-color: {btn_bg};
+    color: {fg};
+    border: 1px solid {border};
+    border-radius: 6px;
+    padding: 6px 16px;
+}}
+{_scoped('QPushButton:hover')} {{ background-color: {btn_hover}; }}
+{_scoped('QPushButton:pressed')} {{ background-color: {btn_bg}; }}
+{_scoped('QPushButton:disabled')} {{ color: {muted}; }}
+{_scoped('QCheckBox')}, {_scoped('QRadioButton')} {{ color: {fg}; background: transparent; }}
+{fields} {{
+    background-color: {field_bg};
+    color: {fg};
+    border: 1px solid {border};
+    border-radius: 6px;
+    padding: 6px 12px;
+    selection-background-color: #456f9f;
+}}
+"""
+
+
+def theme_pick(theme: str, light_value, dark_value):
+    """按应用主题取值：浅色底板必须配深色字，其余主题保持原色不变。
+
+    调用点保留自己原来的深色主题颜色，只在 light 分支替换，保证默认主题零回归。
+    """
+    return light_value if theme == "light" else dark_value
+
+
+# 深色主题下的前景色 -> 浅色底板上等价的高对比深色字。
+_LIGHT_TEXT_COLORS = {
+    "#ffffff": "#0f172a", "#f8fafc": "#0f172a", "#f1f5f9": "#0f172a",
+    "#e2e8f0": "#334155", "#cbd5e1": "#334155", "#a9b6c8": "#334155",
+    "#94a3b8": "#475569", "#64748b": "#475569", "#8b919b": "#475569",
+    "#60a5fa": "#1d4ed8", "#38bdf8": "#0369a1", "#93c5fd": "#1e40af",
+    "#10b981": "#047857", "#f59e0b": "#b45309", "#ef4444": "#b91c1c",
+    "#a855f7": "#7e22ce",
+}
+
+
+def light_text(dark_color: str) -> str:
+    return _LIGHT_TEXT_COLORS.get(dark_color.lower(), "#0f172a")
+
+
+def system_is_light() -> bool:
+    """取系统明暗；平台不提供时退回窗口底色亮度判断。"""
+    hints = QGuiApplication.styleHints()
+    getter = getattr(hints, "colorScheme", None)
+    enum = getattr(Qt, "ColorScheme", None)
+    if getter and enum:
+        try:
+            scheme = getter()
+            if scheme == enum.Light:
+                return True
+            if scheme == enum.Dark:
+                return False
+        except Exception:
+            pass
+    return QGuiApplication.palette().color(QPalette.ColorRole.Window).lightness() > 128
+
+
+def apply_global_style(app):
+    """启动时按系统明暗装好全局样式，运行中切换系统主题也同步刷新。"""
+    def refresh(*_):
+        app.setStyleSheet(GLOBAL_QSS + native_dialog_qss(system_is_light()))
+
+    refresh()
+    changed = getattr(QGuiApplication.styleHints(), "colorSchemeChanged", None)
+    if changed is not None:
+        changed.connect(refresh)
 
 
 def _paint_flat_checkable(widget, is_radio: bool):

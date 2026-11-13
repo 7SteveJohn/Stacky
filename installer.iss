@@ -1,6 +1,6 @@
 ; Inno Setup 6 Script for Stacky (灵叠)
 #define MyAppName "Stacky 灵叠"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "Stacky Desktop Labs"
 #define MyAppExeName "BigFolderLauncher.exe"
 #define SourceAppDir "dist\BigFolderLauncher"

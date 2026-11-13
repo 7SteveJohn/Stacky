@@ -15,6 +15,7 @@ desktop_widgets.py - 超椭圆桌面小组件矩阵（移动端大厂风格）
 from stacky.paths import ROOT
 
 import os
+import re
 import sys
 import time
 import datetime
@@ -37,6 +38,11 @@ from grid_snap import get_all_desktop_card_rects
 from widget_grid import SnapDragMixin
 from icon_utils import create_squircle_path, draw_liquid_glass
 from media_service import get_media_service, get_lyrics_service
+from ui_kit import theme_pick, light_text
+
+# 只匹配独立的 color 声明，跳过 background-color / border-color 等
+_COLOR_DECL = re.compile(
+    r"(?<![\w-])color\s*:\s*(?:#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))", re.I)
 
 
 def add_common_widget_actions(menu, win):
@@ -108,14 +114,14 @@ WIN_W_2X1 = CARD_W_2X1 + MARGIN_SHADOW * 2
 WIN_H_2X1 = CARD_H_2X1 + MARGIN_SHADOW * 2
 
 
-def _media_button_icon(kind: str, size: int = 18) -> QIcon:
+def _media_button_icon(kind: str, size: int = 18, color: QColor = None) -> QIcon:
     """自绘播放控制图标：emoji 在部分系统字体会渲染成空方块。"""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor(255, 255, 255, 240))
+    p.setBrush(color if color is not None else QColor(255, 255, 255, 240))
     s = float(size)
     if kind in ("play", "prev", "next"):
         path = QPainterPath()
@@ -353,7 +359,36 @@ class BaseDesktopWidgetWindow(ResizableWidgetMixin, SnapDragMixin, QWidget):
 
     def set_theme(self, theme: str):
         self.theme = theme
+        self._apply_text_colors()
+        self._on_theme_changed()
         self.update()
+
+    def _on_theme_changed(self):
+        """子类在此重刷那些由定时器/播放状态动态改色的标签。"""
+        pass
+
+    def _tint(self, widget, light_color: str):
+        """浅色底板上把透明承载区的文字压成深色；其余主题恢复原 QSS。
+
+        用「原 QSS 末尾追加一条 color」而不是重写样式，深色主题逐属性不变。
+        """
+        if not hasattr(widget, "_dark_qss"):
+            widget._dark_qss = widget.styleSheet()
+        if self.theme == "light":
+            # 直接替换声明，对裸 QSS 和 QLabel/QPushButton { ... } 块形式都生效
+            widget.setStyleSheet(_COLOR_DECL.sub(f"color: {light_color}", widget._dark_qss))
+        else:
+            widget.setStyleSheet(widget._dark_qss)
+
+    def _apply_text_colors(self):
+        """只处理标了 light_text 的控件：那些文字直接落在透明/浅色底板上。"""
+        for w in self.findChildren(QWidget):
+            light_color = w.property("light_text")
+            if light_color:
+                self._tint(w, light_color)
+
+    def _dynamic_color(self, dark_color: str) -> str:
+        return theme_pick(self.theme, light_text(dark_color), dark_color)
 
     def _update_window_size(self):
         w = self.card_w + MARGIN_SHADOW * 2
@@ -580,8 +615,10 @@ class ClockWidgetWindow(BaseDesktopWidgetWindow):
         top_row = QHBoxLayout()
         self.lbl_tag = QLabel("时钟与日历", self.content_widget)
         self.lbl_tag.setStyleSheet("color: #60a5fa; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;")
+        self.lbl_tag.setProperty("light_text", "#1d4ed8")
         self.lbl_sec = QLabel("", self.content_widget)
         self.lbl_sec.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_sec.setProperty("light_text", "#475569")
         top_row.addWidget(self.lbl_tag)
         top_row.addStretch()
         top_row.addWidget(self.lbl_sec)
@@ -596,12 +633,14 @@ class ClockWidgetWindow(BaseDesktopWidgetWindow):
             font-weight: 700;
             font-family: 'Segoe UI Variable Display', 'Segoe UI', 'PingFang SC', sans-serif;
         """)
+        self.lbl_time.setProperty("light_text", "#0f172a")
         self.layout.addWidget(self.lbl_time, stretch=1)
 
         # 日期与星期
         self.lbl_date = QLabel("", self.content_widget)
         self.lbl_date.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_date.setStyleSheet("color: #e2e8f0; font-size: 13px; font-weight: 500;")
+        self.lbl_date.setProperty("light_text", "#334155")
         self.layout.addWidget(self.lbl_date)
 
         # 底部状态/问候
@@ -614,7 +653,10 @@ class ClockWidgetWindow(BaseDesktopWidgetWindow):
             border-radius: 8px;
             padding: 4px 8px;
         """)
+        self.lbl_status.setProperty("light_text", "#475569")
         self.layout.addWidget(self.lbl_status)
+
+        self._apply_text_colors()
 
     def _on_tick(self):
         now = datetime.datetime.now()
@@ -648,14 +690,19 @@ class ClockWidgetWindow(BaseDesktopWidgetWindow):
             self.mode = "2x1"
             self.card_w = CARD_W_2X1
             self.card_h = CARD_H_2X1
-            self.lbl_time.setStyleSheet("color: #ffffff; font-size: 38px; font-weight: 700;")
+            size = 38
             self.lbl_status.hide()
         else:
             self.mode = "2x2"
             self.card_w = CARD_W_2X2
             self.card_h = CARD_H_2X2
-            self.lbl_time.setStyleSheet("color: #ffffff; font-size: 52px; font-weight: 700;")
+            size = 52
             self.lbl_status.show()
+
+        qss = f"color: #ffffff; font-size: {size}px; font-weight: 700;"
+        self.lbl_time.setStyleSheet(qss)
+        self.lbl_time._dark_qss = qss
+        self._apply_text_colors()
 
         self._update_window_size()
         self.content_widget.setGeometry(MARGIN_SHADOW, MARGIN_SHADOW, self.card_w, self.card_h)
@@ -762,6 +809,7 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
         top_row = QHBoxLayout()
         lbl_tag = QLabel("系统硬件管家", self.content_widget)
         lbl_tag.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;")
+        lbl_tag.setProperty("light_text", "#0369a1")
         self.lbl_health = QLabel("● 系统流畅", self.content_widget)
         self.lbl_health.setStyleSheet("color: #10b981; font-size: 11px; font-weight: 500;")
         top_row.addWidget(lbl_tag)
@@ -771,7 +819,9 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
 
         # CPU / RAM 两行 + 多盘并排区
         self.lbl_cpu_val = QLabel("0%", self.content_widget)
+        self.lbl_cpu_val.setProperty("light_text", "#0369a1")
         self.lbl_ram_val = QLabel("0%", self.content_widget)
+        self.lbl_ram_val.setProperty("light_text", "#7e22ce")
 
         self.layout.addWidget(self._create_metric_row("CPU 处理器", self.lbl_cpu_val, "#38bdf8"))
         self.layout.addWidget(self._create_metric_row("RAM 运行内存", self.lbl_ram_val, "#a855f7"))
@@ -788,7 +838,10 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
         self.lbl_desc = QLabel("实时采集 · 极低功耗运行", self.content_widget)
         self.lbl_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_desc.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.lbl_desc.setProperty("light_text", "#475569")
         self.layout.addWidget(self.lbl_desc)
+
+        self._apply_text_colors()
 
     def _create_metric_row(self, title: str, val_label: QLabel, color_hex: str) -> QWidget:
         row = QWidget(self.content_widget)
@@ -799,6 +852,7 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
         t_row = QHBoxLayout()
         lbl_t = QLabel(title, row)
         lbl_t.setStyleSheet("color: #e2e8f0; font-size: 12px; font-weight: 500;")
+        lbl_t.setProperty("light_text", "#334155")
         val_label.setStyleSheet(f"color: {color_hex}; font-size: 12px; font-weight: 700;")
         t_row.addWidget(lbl_t)
         t_row.addStretch()
@@ -836,8 +890,10 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
             head = QHBoxLayout()
             t = QLabel(drive.rstrip("\\"), cell)
             t.setStyleSheet("color: #e2e8f0; font-size: 10px; font-weight: 600;")
+            t.setProperty("light_text", "#334155")
             val = QLabel("0%", cell)
             val.setStyleSheet("color: #10b981; font-size: 10px; font-weight: 700;")
+            val.setProperty("light_text", "#047857")
             head.addWidget(t)
             head.addStretch()
             head.addWidget(val)
@@ -850,6 +906,10 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
         # 兼容既有调用：第一个分区的数值标签
         first = self.disk_drives[0]
         self.lbl_disk_val = self.disk_rows[first][0]
+        self._apply_text_colors()
+
+    def _on_theme_changed(self):
+        self._refresh_stats()
 
     def _refresh_stats(self):
         try:
@@ -869,13 +929,15 @@ class SystemMonitorWidgetWindow(BaseDesktopWidgetWindow):
             # 动态调整健康状态
             if self.cpu_pct > 85 or self.ram_pct > 90:
                 self.lbl_health.setText("● 负载偏高")
-                self.lbl_health.setStyleSheet("color: #ef4444; font-size: 11px; font-weight: 600;")
+                c, weight = "#ef4444", 600
             elif self.cpu_pct > 60 or self.ram_pct > 75:
                 self.lbl_health.setText("● 运行繁忙")
-                self.lbl_health.setStyleSheet("color: #f59e0b; font-size: 11px; font-weight: 500;")
+                c, weight = "#f59e0b", 500
             else:
                 self.lbl_health.setText("● 系统流畅")
-                self.lbl_health.setStyleSheet("color: #10b981; font-size: 11px; font-weight: 500;")
+                c, weight = "#10b981", 500
+            self.lbl_health.setStyleSheet(
+                f"color: {self._dynamic_color(c)}; font-size: 11px; font-weight: {weight};")
 
             # 动态重绘进度条颜色与宽度
             self._update_row_bar(0, self.cpu_pct, "#38bdf8")
@@ -1157,6 +1219,7 @@ class MemoWidgetWindow(BaseDesktopWidgetWindow):
                 color: #ef4444;
             }
         """)
+        self.btn_clear_done.setProperty("light_text", "#334155")
         self.btn_clear_done.clicked.connect(self._clear_done_todos)
         todo_bottom.addWidget(self.lbl_todo_summary)
         todo_bottom.addStretch()
@@ -1171,6 +1234,7 @@ class MemoWidgetWindow(BaseDesktopWidgetWindow):
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(500)
         self.save_timer.timeout.connect(self._save_memo_to_disk)
+        self._apply_text_colors()
 
     def _switch_tab(self, index: int):
         if hasattr(self, "save_timer") and self.save_timer.isActive():
@@ -1503,14 +1567,19 @@ class RoundMediaButton(QPushButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        light = getattr(self.window(), "theme", "dark") == "light"
         if self.accent:
             grad = QLinearGradient(r.topLeft(), r.bottomRight())
             grad.setColorAt(0.0, QColor("#60a5fa"))
             grad.setColorAt(1.0, QColor("#2563eb"))
             p.setBrush(QBrush(grad))
+            p.setPen(Qt.PenStyle.NoPen)
+        elif light:
+            p.setBrush(QColor(255, 255, 255, 170 if self.underMouse() else 120))
+            p.setPen(QPen(QColor(15, 23, 42, 60), 1.0))
         else:
             p.setBrush(QColor(255, 255, 255, 38 if self.underMouse() else 20))
-        p.setPen(Qt.PenStyle.NoPen)
+            p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(r)
         if not self.icon().isNull():
             sz = min(self.width(), self.height()) - 12
@@ -1521,7 +1590,7 @@ class RoundMediaButton(QPushButton):
             f.setPointSize(9)
             f.setBold(True)
             p.setFont(f)
-            p.setPen(QColor("#ffffff"))
+            p.setPen(QColor("#0f172a") if light else QColor("#ffffff"))
             p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text())
         p.end()
 
@@ -1687,11 +1756,21 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
             self._build_2x1_layout()
         else:
             self._build_2x2_layout()
+        self._apply_text_colors()
+
+    def _on_theme_changed(self):
+        self._refresh_lyric(self._position)
+        if hasattr(self, "lbl_status"):
+            self._on_playback_status_changed(self._is_playing)
+        if hasattr(self, "btn_prev"):
+            self._apply_control_icons()
 
     def _apply_control_icons(self):
         """三个控制键统一用自绘图标，避免 emoji 在缺字体环境下变空方块。"""
-        self.btn_prev.setIcon(_media_button_icon("prev"))
-        self.btn_next.setIcon(_media_button_icon("next"))
+        side = theme_pick(self.theme, QColor(15, 23, 42, 235), QColor(255, 255, 255, 240))
+        self.btn_prev.setIcon(_media_button_icon("prev", color=side))
+        self.btn_next.setIcon(_media_button_icon("next", color=side))
+        # 主按钮是蓝色实心圆，白色图标对比最好，不随主题变
         self.btn_play_pause.setIcon(_media_button_icon("pause" if self._is_playing else "play"))
         for btn in (self.btn_prev, self.btn_play_pause, self.btn_next):
             btn.setText("")
@@ -1711,7 +1790,7 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
         lbl = QLabel("", parent)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setMinimumHeight(15)
-        lbl.setStyleSheet("color:#93c5fd; font-size:11px; font-weight:500;"
+        lbl.setStyleSheet(f"color:{self._dynamic_color('#93c5fd')}; font-size:11px; font-weight:500;"
                           " background:transparent; padding:1px 6px; margin-bottom:2px;")
         return lbl
 
@@ -1744,7 +1823,7 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
         if self.lbl_lyric.text() != text:
             self.lbl_lyric.setText(text)
         # 100ms 插值会高频走到这里；QSS 重解析很贵，只在颜色变化时设一次
-        color = "#93c5fd" if has_lines else "#8b919b"
+        color = self._dynamic_color("#93c5fd" if has_lines else "#8b919b")
         if getattr(self, "_lyric_color", None) != color:
             self._lyric_color = color
             self.lbl_lyric.setStyleSheet(
@@ -1769,6 +1848,7 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
         for lbl in (self.lbl_pos, self.lbl_dur):
             lbl.setFixedWidth(34)
             lbl.setStyleSheet("color: rgba(226,232,240,0.85); font-size:10px; background:transparent;")
+            lbl.setProperty("light_text", "#0f172a")
         box.addWidget(self.lbl_pos)
         box.addWidget(self.progress_slider, stretch=1)
         box.addWidget(self.lbl_dur)
@@ -1871,13 +1951,14 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
                 hint = ("跳转未生效·请打开一次主界面" if "QQ音乐" in self._source_app
                         else f"{self._source_app} 不开放进度跳转")
                 self.lbl_status.setText(hint)
-                self.lbl_status.setStyleSheet("color:#fbbf24; font-size:10px; font-weight:600;")
+                self.lbl_status.setStyleSheet(
+                    f"color:{self._dynamic_color('#f59e0b')}; font-size:10px; font-weight:600;")
                 QTimer.singleShot(2600, self._restore_status)
 
     def _restore_status(self):
         if hasattr(self, "lbl_status"):
             self.lbl_status.setText(self._status_text("● 正在播放" if self._is_playing else "○ 待机"))
-            color = "#10b981" if self._is_playing else "#64748b"
+            color = self._dynamic_color("#10b981") if self._is_playing else self._dynamic_color("#64748b")
             self.lbl_status.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 500;")
 
     def _build_2x2_layout(self):
@@ -1889,9 +1970,10 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
         top_bar = QHBoxLayout()
         self.lbl_source = QLabel(self._source_app, self.content_widget)
         self.lbl_source.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;")
+        self.lbl_source.setProperty("light_text", "#0369a1")
 
         self.lbl_status = QLabel("● 正在播放" if self._is_playing else "○ 待机", self.content_widget)
-        st_color = "#10b981" if self._is_playing else "#64748b"
+        st_color = self._dynamic_color("#10b981") if self._is_playing else self._dynamic_color("#64748b")
         self.lbl_status.setStyleSheet(f"color: {st_color}; font-size: 11px; font-weight: 500;")
 
         top_bar.addWidget(self.lbl_source)
@@ -1921,11 +2003,13 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
                 padding: 0 4px;
             }
         """)
+        self.lbl_title.setProperty("light_text", "#0f172a")
 
         self.lbl_artist = QLabel(self._artist_name, self.content_widget)
         self.lbl_artist.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_artist.setStyleSheet(
             "color: #a9b6c8; font-size: 10px; background: transparent; padding: 0 4px;")
+        self.lbl_artist.setProperty("light_text", "#334155")
 
         info_col.addWidget(self.lbl_title)
         info_col.addWidget(self.lbl_artist)
@@ -1980,8 +2064,9 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
         top_row = QHBoxLayout()
         self.lbl_source = QLabel(self._source_app, self.content_widget)
         self.lbl_source.setStyleSheet("color: #38bdf8; font-size: 10px; font-weight: 600;")
+        self.lbl_source.setProperty("light_text", "#0369a1")
         self.lbl_status = QLabel("● 播放中" if self._is_playing else "○ 待机", self.content_widget)
-        st_color = "#10b981" if self._is_playing else "#64748b"
+        st_color = self._dynamic_color("#10b981") if self._is_playing else self._dynamic_color("#64748b")
         self.lbl_status.setStyleSheet(f"color: {st_color}; font-size: 10px;")
         top_row.addWidget(self.lbl_source)
         top_row.addStretch()
@@ -1992,9 +2077,11 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
         self.lbl_title.setStyleSheet(
             "color: #ffffff; font-size: 13px; font-weight: 600;"
             " background: transparent; padding: 0 4px;")
+        self.lbl_title.setProperty("light_text", "#0f172a")
         self.lbl_artist = QLabel(self._artist_name, self.content_widget)
         self.lbl_artist.setStyleSheet(
             "color: #a9b6c8; font-size: 10px; background: transparent; padding: 0 4px;")
+        self.lbl_artist.setProperty("light_text", "#334155")
         right_col.addWidget(self.lbl_title)
         right_col.addWidget(self.lbl_artist)
         self.lbl_lyric = self._create_lyric_label(self.content_widget)
@@ -2165,7 +2252,8 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
             self.lbl_source.setText(self._source_app)
         if hasattr(self, "lbl_status"):
             st_text = self._status_text("● 正在播放" if self._is_playing else ("⏸ 已暂停" if info.get("has_media") else "○ 待机"))
-            st_color = "#10b981" if self._is_playing else ("#f59e0b" if info.get("has_media") else "#64748b")
+            st_dark = "#10b981" if self._is_playing else ("#f59e0b" if info.get("has_media") else "#64748b")
+            st_color = self._dynamic_color(st_dark)
             self.lbl_status.setText(st_text)
             self.lbl_status.setStyleSheet(f"color: {st_color}; font-size: 11px; font-weight: 500;")
         if hasattr(self, "btn_play_pause"):
@@ -2181,7 +2269,7 @@ class NowPlayingWidgetWindow(BaseDesktopWidgetWindow):
             self.btn_play_pause.setIcon(_media_button_icon("pause" if self._is_playing else "play"))
         if hasattr(self, "lbl_status"):
             st_text = self._status_text("● 正在播放" if self._is_playing else "⏸ 已暂停")
-            st_color = "#10b981" if self._is_playing else "#f59e0b"
+            st_color = self._dynamic_color("#10b981") if self._is_playing else self._dynamic_color("#f59e0b")
             self.lbl_status.setText(st_text)
             self.lbl_status.setStyleSheet(f"color: {st_color}; font-size: 11px; font-weight: 500;")
 

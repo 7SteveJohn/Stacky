@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import ctypes
 from ctypes import wintypes
@@ -9,7 +10,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QLinearGradient, QRadialGradient,
-    QPainterPath, QPixmap, QKeyEvent, QCursor, QFontMetrics, QDrag
+    QPainterPath, QPixmap, QKeyEvent, QCursor, QFontMetrics, QDrag, QPalette
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
@@ -30,7 +31,33 @@ from search_utils import (
 )
 from widgets import run_as_admin, show_file_properties
 from web_dialog import AddWebBookmarkDialog
+from ui_kit import theme_pick
 from PySide6.QtWidgets import QDialog
+
+
+def _drawer_theme(widget) -> str:
+    """抽屉自绘控件从所属顶层覆盖层读主题；不在抽屉内时按深色处理。"""
+    owner = widget.window() if widget is not None else None
+    return getattr(owner, "theme", "dark")
+
+
+def _ink(widget, light, dark):
+    """浅色底板上的文字/图标换成深色；其余主题原样返回，保证零回归。"""
+    return theme_pick(_drawer_theme(widget), light, dark)
+
+
+_INK_LIGHT = QColor(15, 23, 42, 245)
+_INK_LIGHT_SUB = QColor(71, 85, 105, 235)
+_INK_LIGHT_BLUE = QColor(30, 64, 175, 235)
+
+
+_DRAWER_COLOR_DECL = re.compile(
+    r"(?<![\w-])color\s*:\s*(?:#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))", re.I)
+
+
+def recolor_qss(qss: str, color: str) -> str:
+    """把 QSS 里的 color 声明整体换掉，裸声明与选择器块两种写法都能覆盖。"""
+    return _DRAWER_COLOR_DECL.sub(f"color: {color}", qss)
 
 
 class ModernInputDialog(QDialog):
@@ -462,7 +489,7 @@ class MobileExpandedItemWidget(QWidget):
             font1.setFamilies(["Microsoft YaHei UI", "PingFang SC", "Segoe UI Variable Text", "Segoe UI"])
             font1.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
             painter.setFont(font1)
-            painter.setPen(QColor(255, 255, 255, 245))
+            painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 245)))
             fm1 = painter.fontMetrics()
             elided1 = fm1.elidedText(name, Qt.TextElideMode.ElideRight, int(w - 8))
             painter.drawText(QRectF(4, 54, w - 8, 18), Qt.AlignmentFlag.AlignCenter, elided1)
@@ -471,7 +498,7 @@ class MobileExpandedItemWidget(QWidget):
             font2.setFamilies(["Microsoft YaHei UI", "PingFang SC", "Segoe UI Variable Text", "Segoe UI"])
             font2.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
             painter.setFont(font2)
-            painter.setPen(QColor(148, 163, 184, 210))
+            painter.setPen(_ink(self, _INK_LIGHT_SUB, QColor(148, 163, 184, 210)))
             sub_text = os.path.splitext(os.path.basename(path_str))[1].upper() if path_str else "APP"
             if not sub_text:
                 sub_text = "APP"
@@ -487,7 +514,7 @@ class MobileExpandedItemWidget(QWidget):
             elided = fm.elidedText(name, Qt.TextElideMode.ElideMiddle, int(w - 10))
             # 只画一遍前景，去掉 0.8px 偏移阴影（避免文字重影）
             # Forefront Text (pure crisp white)
-            painter.setPen(QColor(255, 255, 255, 255))
+            painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 255)))
             painter.drawText(QRectF(4, 70, w - 8, 22), Qt.AlignmentFlag.AlignCenter, elided)
 
         painter.end()
@@ -840,7 +867,7 @@ class SearchBannerWidget(QWidget):
             font_icon = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
             font_icon.setFamilies(["Segoe UI", "Microsoft YaHei UI", "PingFang SC"])
             painter.setFont(font_icon)
-            painter.setPen(QColor(255, 255, 255))
+            painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255)))
             painter.drawText(QRectF(14, 0, 28, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, icon_str)
 
         # 3. Enter key badge on far right
@@ -857,7 +884,7 @@ class SearchBannerWidget(QWidget):
 
         font_badge = QFont("Segoe UI Variable Display", 9, QFont.Weight.Medium)
         painter.setFont(font_badge)
-        painter.setPen(QColor(255, 255, 255, 220))
+        painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 220)))
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "Enter")
 
         # 4. Main title text
@@ -869,7 +896,9 @@ class SearchBannerWidget(QWidget):
         font_title = QFont("Segoe UI Variable Display", 11, QFont.Weight.Medium)
         font_title.setFamilies(["Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI"])
         painter.setFont(font_title)
-        painter.setPen(QColor(255, 255, 255, 240) if not self.is_selected else QColor(255, 255, 255, 255))
+        painter.setPen(_ink(self, _INK_LIGHT,
+                            QColor(255, 255, 255, 240) if not self.is_selected
+                            else QColor(255, 255, 255, 255)))
 
         fm = painter.fontMetrics()
         avail_w = int(badge_x - 52 - 10)
@@ -1032,7 +1061,7 @@ class SearchFileBannerWidget(QWidget):
         painter.fillPath(b_path, bg_badge)
         painter.strokePath(b_path, QPen(border_badge, 0.8))
         painter.setFont(font_badge)
-        painter.setPen(text_badge)
+        painter.setPen(_ink(self, _INK_LIGHT_BLUE, text_badge))
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, ext_text)
 
         # 4. Text (Two rows: name and directory)
@@ -1042,7 +1071,9 @@ class SearchFileBannerWidget(QWidget):
         font_name = QFont("Segoe UI Variable Display", 11, QFont.Weight.Medium)
         font_name.setFamilies(["Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI"])
         painter.setFont(font_name)
-        painter.setPen(QColor(255, 255, 255, 245) if not self.is_selected else QColor(255, 255, 255, 255))
+        painter.setPen(_ink(self, _INK_LIGHT,
+                            QColor(255, 255, 255, 245) if not self.is_selected
+                            else QColor(255, 255, 255, 255)))
         fm_name = painter.fontMetrics()
         elided_name = fm_name.elidedText(file_name, Qt.TextElideMode.ElideRight, avail_w)
         painter.drawText(QRectF(52, 7, avail_w, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_name)
@@ -1054,7 +1085,9 @@ class SearchFileBannerWidget(QWidget):
         font_path = QFont("Segoe UI Variable Display", 9, QFont.Weight.Normal)
         font_path.setFamilies(["Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI"])
         painter.setFont(font_path)
-        painter.setPen(QColor(148, 163, 184, 210) if not self.is_selected else QColor(191, 219, 254, 230))
+        painter.setPen(_ink(self, _INK_LIGHT_SUB,
+                            QColor(148, 163, 184, 210) if not self.is_selected
+                            else QColor(191, 219, 254, 230)))
         fm_path = painter.fontMetrics()
         elided_path = fm_path.elidedText(dir_path, Qt.TextElideMode.ElideMiddle, avail_w)
         painter.drawText(QRectF(52, 27, avail_w, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_path)
@@ -1324,7 +1357,7 @@ class VectorIconButton(QPushButton):
         # 2. Vector Glyph
         cx, cy = w / 2.0, h / 2.0
         if self.icon_type == "close":
-            pen = QPen(QColor(255, 255, 255, 245), 1.6)
+            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 245)), 1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             r = 4.2
@@ -1332,7 +1365,7 @@ class VectorIconButton(QPushButton):
             painter.drawLine(QPoint(int(cx - r), int(cy + r)), QPoint(int(cx + r), int(cy - r)))
 
         elif self.icon_type == "search":
-            pen = QPen(QColor(255, 255, 255, 240), 1.6)
+            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)), 1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1348,7 +1381,7 @@ class VectorIconButton(QPushButton):
             painter.drawLine(p_start, p_end)
 
         elif self.icon_type == "tidy":
-            pen = QPen(QColor(255, 255, 255, 240), 1.6)
+            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)), 1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1358,7 +1391,7 @@ class VectorIconButton(QPushButton):
             painter.drawLine(QPoint(int(cx - 3), int(cy)), QPoint(int(cx + 3), int(cy)))
 
         elif self.icon_type == "settings":
-            pen = QPen(QColor(255, 255, 255, 240), 1.5)
+            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)), 1.5)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1367,13 +1400,13 @@ class VectorIconButton(QPushButton):
             painter.drawLine(QPoint(int(cx - 6), int(y1)), QPoint(int(cx + 6), int(y1)))
             painter.drawLine(QPoint(int(cx - 6), int(y2)), QPoint(int(cx + 6), int(y2)))
             painter.drawLine(QPoint(int(cx - 6), int(y3)), QPoint(int(cx + 6), int(y3)))
-            painter.setBrush(QColor(255, 255, 255, 240))
+            painter.setBrush(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)))
             painter.drawEllipse(QRectF(cx - 4, y1 - 1.8, 3.6, 3.6))
             painter.drawEllipse(QRectF(cx + 1, y2 - 1.8, 3.6, 3.6))
             painter.drawEllipse(QRectF(cx - 2, y3 - 1.8, 3.6, 3.6))
 
         elif self.icon_type == "add":
-            pen = QPen(QColor(255, 255, 255, 230), 1.6)
+            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 230)), 1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.drawLine(QPoint(int(cx - 5), int(cy)), QPoint(int(cx + 5), int(cy)))
@@ -1445,6 +1478,8 @@ class SubgroupPillButton(QPushButton):
                     border: 1px solid rgba(255, 255, 255, 0.22);
                 }
             """)
+        if _drawer_theme(self) == "light":
+            self.setStyleSheet(recolor_qss(self.styleSheet(), "#0f172a"))
 
     def contextMenuEvent(self, event):
         if self.subgroup_name in ("全部", "All"):
@@ -1791,6 +1826,12 @@ class HeroExpandedFolderOverlay(QWidget):
                 background: rgba(0, 0, 0, 60);
             }
         """)
+        if self.theme == "light":
+            self.title_edit.setStyleSheet(
+                self.title_edit.styleSheet() +
+                "\nQLineEdit { color: #0f172a; }"
+                "\nQLineEdit:hover { background: rgba(15, 23, 42, 0.06); }"
+                "\nQLineEdit:focus { color: #0f172a; background: rgba(255, 255, 255, 0.92); }")
         self.title_edit.editingFinished.connect(self.on_title_edited)
         header_bar.addWidget(self.title_edit)
 
@@ -1828,6 +1869,14 @@ class HeroExpandedFolderOverlay(QWidget):
                 background-color: rgba(0, 0, 0, 75);
             }
         """)
+        if self.theme == "light":
+            self.search_input.setStyleSheet(
+                self.search_input.styleSheet() +
+                "\nQLineEdit { color: #0f172a; background-color: rgba(255, 255, 255, 0.92); }"
+                "\nQLineEdit:focus { color: #0f172a; background-color: rgba(255, 255, 255, 0.98); }")
+            pal = self.search_input.palette()
+            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#64748b"))
+            self.search_input.setPalette(pal)
         self._search_debounce_timer = QTimer(self)
         self._search_debounce_timer.setSingleShot(True)
         self._search_debounce_timer.setInterval(120)

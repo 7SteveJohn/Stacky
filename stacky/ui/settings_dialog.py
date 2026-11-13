@@ -558,7 +558,7 @@ class SettingsDialog(CenteredDialog):
         s_box.addWidget(self.nav_list, stretch=1)
 
         # 列表撑满侧栏高度，底部一行版本信息锚住，避免一长条空白
-        ver = QLabel("v1.0.0", sidebar_frame)
+        ver = QLabel("v1.0.1", sidebar_frame)
         ver.setObjectName("sidebarVersion")
         s_box.addWidget(ver)
         main_layout.addWidget(sidebar_frame)

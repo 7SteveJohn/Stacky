@@ -96,7 +96,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 import stacky  # 把 stacky/* 子目录加入 sys.path，保持扁平导入可用
 
 from config_manager import ConfigManager
-from ui_kit import GLOBAL_QSS
+from ui_kit import apply_global_style
 from main_window import BigFolderWindow, BigFolderWindowManager
 from shortcut_utils import generate_mydock_shortcut
 from autostart_utils import clean_legacy_autostart
@@ -216,7 +216,7 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    app.setStyleSheet(GLOBAL_QSS)
+    apply_global_style(app)
 
     # Clean up any dead socket from prior crash
     QLocalServer.removeServer(IPC_SERVER_NAME)
