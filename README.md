@@ -21,8 +21,8 @@ Windows 10/11 桌面视窗矩阵与应用启动台。用超椭圆卡片把常用
 
 从 [Releases](../../releases) 下载：
 
-- `Stacky-灵叠-安装程序.exe` —— 安装版
-- `Stacky-灵叠-绿色便携版.zip` —— 解压即用
+- `Stacky-1.0.0-Setup-x64.exe` —— 安装版
+- `Stacky-1.0.0-Portable-x64.zip` —— 解压即用
 
 ## 从源码运行
 
