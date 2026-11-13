@@ -72,6 +72,7 @@ Windows 10 / 11 桌面视窗矩阵与应用启动台。把常用应用、文件�
 - 按用户安装，无需管理员权限，不触发 UAC
 - 覆盖安装保留 `config.json` 与所有物理分类，只替换程序文件
 - 提供安装版与绿色便携版两种分发形式
+- **配置导入 / 导出**：设置 → 备份，可把卡片、布局、主题与组件位置导出为 `config.json` 备份；导入前自动保存当前配置
 
 ## 界面与操作
 
@@ -150,7 +151,7 @@ stacky/
   media/                 系统媒体会话、播放位置控制
   services/              天气、文件索引 IPC
   ui/                    通用控件、图标提取、亚克力、设置与网页对话框
-  utils/                 搜索、快捷方式、自启、旧版数据迁移
+  utils/                 搜索、快捷方式、自启、资产迁移
 BigFolderLauncher.spec   PyInstaller 打包配置
 installer.iss            Inno Setup 安装脚本
 requirements.txt         运行依赖

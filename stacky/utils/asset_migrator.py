@@ -147,7 +147,7 @@ def stop_legacy() -> Tuple[bool, str]:
     """
     procs = get_legacy_processes()
     if not procs:
-        return (True, "旧版程序进程当前未在运行")
+        return (True, "程序进程当前未在运行")
 
     try:
         # Graceful close via taskkill (without /F first)
@@ -173,13 +173,13 @@ def stop_legacy() -> Tuple[bool, str]:
                     timeout=3
                 )
         except Exception as e:
-            return (False, f"停止旧版程序进程失败: {e}")
+            return (False, f"停止程序进程失败: {e}")
 
     remaining_after = get_legacy_processes()
     if not remaining_after:
-        return (True, f"已安全退出旧版程序进程 (共终止 {len(procs)} 个进程)")
+        return (True, f"已安全退出程序进程 (共终止 {len(procs)} 个进程)")
     else:
-        return (False, f"仍有 {len(remaining_after)} 个旧版程序进程未能终止")
+        return (False, f"仍有 {len(remaining_after)} 个程序进程未能终止")
 
 
 def detect_legacy_environment(window_manager=None) -> Dict[str, Any]:
@@ -378,7 +378,7 @@ class LegacyMigrationDialog(CenteredDialog):
     def __init__(self, window_manager=None, parent=None):
         super().__init__(parent)
         self.window_manager = window_manager
-        self.setWindowTitle("旧版桌面工具资产迁移与协同管理")
+        self.setWindowTitle("桌面资产迁移")
         # 760 是常规高度；小屏按可用区域收缩，避免底部按钮跑出屏幕
         self.setMinimumSize(620, 600)
         _screen = QApplication.primaryScreen()
@@ -410,8 +410,8 @@ class LegacyMigrationDialog(CenteredDialog):
             background-color: rgba(255, 255, 255, 18);
             color: #ffffff;
             border: 1px solid rgba(255, 255, 255, 35);
-            border-radius: 8px;
-            padding: 8px 16px;
+            border-radius: 6px;
+            padding: 8px 14px;
             font-size: 13px;
             font-weight: 500;
         }
@@ -423,33 +423,53 @@ class LegacyMigrationDialog(CenteredDialog):
             background-color: rgba(255, 255, 255, 12);
         }
         QPushButton#primaryBtn {
-            background-color: #2b6cb0;
-            border: 1px solid #4299e1;
+            background-color: #2f6f9f;
+            border: 1px solid #3d7fae;
             font-weight: 600;
         }
         QPushButton#primaryBtn:hover {
-            background-color: #3182ce;
+            background-color: #377fb4;
         }
         QPushButton#dangerBtn {
-            background-color: rgba(180, 40, 50, 180);
-            border: 1px solid rgba(220, 60, 70, 200);
+            background-color: transparent;
+            border: 1px solid rgba(200, 90, 90, 0.55);
+            color: #e08a8a;
         }
         QPushButton#dangerBtn:hover {
-            background-color: rgba(200, 45, 60, 220);
+            background-color: rgba(180, 60, 60, 0.18);
         }
         QListWidget {
             background-color: rgba(25, 28, 38, 0.95);
             border: 1px solid rgba(255, 255, 255, 25);
-            border-radius: 10px;
-            padding: 4px;
+            border-radius: 8px;
+            padding: 2px;
         }
         QListWidget::item {
-            padding: 8px 6px;
+            padding: 0px;
             border-bottom: 1px solid rgba(255, 255, 255, 10);
             border-radius: 6px;
         }
         QListWidget::item:hover {
             background-color: rgba(255, 255, 255, 15);
+        }
+        QScrollBar:vertical {
+            background: transparent;
+            width: 8px;
+            margin: 2px;
+        }
+        QScrollBar::handle:vertical {
+            background: rgba(255, 255, 255, 0.18);
+            border-radius: 4px;
+            min-height: 24px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: rgba(255, 255, 255, 0.28);
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: transparent;
         }
         QCheckBox {
             color: #ffffff;
@@ -475,11 +495,11 @@ class LegacyMigrationDialog(CenteredDialog):
         # 1. Header
         header_layout = QVBoxLayout()
         header_layout.setSpacing(6)
-        title = QLabel("旧版桌面工具物理资产无损迁移与平滑交接")
+        title = QLabel("桌面资产迁移与协同")
         title.setWordWrap(True)
-        title.setFont(QFont("Segoe UI Variable Display", 16, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI Variable Display", 15, QFont.Weight.DemiBold))
         title.setStyleSheet("color: #ffffff;")
-        subtitle = QLabel("物理目录零修改、零风险，双向实时同步，按网格排列上屏")
+        subtitle = QLabel("把已扫描到的分类映射为桌面卡片，文件仍保留在原目录。")
         subtitle.setWordWrap(True)
         subtitle.setFont(QFont("Segoe UI", 11))
         subtitle.setStyleSheet("color: #a0aec0;")
@@ -494,9 +514,9 @@ class LegacyMigrationDialog(CenteredDialog):
         # 写成 QFrame 会把里面每一行文字都画成独立边框盒。
         self.status_frame.setStyleSheet("""
         QFrame#statusFrame {
-            background-color: rgba(30, 34, 48, 0.85);
-            border: 1px solid rgba(255, 255, 255, 30);
-            border-radius: 10px;
+            background-color: rgba(255, 255, 255, 0.035);
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 8px;
         }
         """)
         status_layout = QVBoxLayout(self.status_frame)
@@ -516,7 +536,7 @@ class LegacyMigrationDialog(CenteredDialog):
 
         # 3. Category Matrix Header
         cat_header = QHBoxLayout()
-        cat_title = QLabel("已扫描到的旧版物理分类：")
+        cat_title = QLabel("已扫描到的分类")
         cat_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         cat_title.setStyleSheet("color: #ffffff;")
         cat_header.addWidget(cat_title)
@@ -535,9 +555,9 @@ class LegacyMigrationDialog(CenteredDialog):
         layout.addWidget(self.list_widget, 1)
 
         # 5. One-Click Matrix Button
-        self.btn_create_matrix = QPushButton("一键生成桌面卡片（16px 网格排列）")
+        self.btn_create_matrix = QPushButton("生成桌面卡片")
         self.btn_create_matrix.setObjectName("primaryBtn")
-        self.btn_create_matrix.setFixedHeight(40)
+        self.btn_create_matrix.setFixedHeight(38)
         self.btn_create_matrix.clicked.connect(self.action_create_matrix)
         layout.addWidget(self.btn_create_matrix)
 
@@ -545,27 +565,26 @@ class LegacyMigrationDialog(CenteredDialog):
         action_bar = QHBoxLayout()
         action_bar.setSpacing(10)
 
-        self.btn_stop_proc = QPushButton("退出旧版程序进程")
+        self.btn_stop_proc = QPushButton("退出程序")
         self.btn_stop_proc.setObjectName("dangerBtn")
         self.btn_stop_proc.setFixedHeight(36)
         self.btn_stop_proc.clicked.connect(self.action_stop_legacy)
-        action_bar.addWidget(self.btn_stop_proc)
+        action_bar.addWidget(self.btn_stop_proc, 1)
 
-        self.btn_toggle_autostart = QPushButton("切换开机自启动")
+        self.btn_toggle_autostart = QPushButton("开机自启动")
         self.btn_toggle_autostart.setFixedHeight(36)
         self.btn_toggle_autostart.clicked.connect(self.action_switch_autostart)
-        action_bar.addWidget(self.btn_toggle_autostart)
+        action_bar.addWidget(self.btn_toggle_autostart, 1)
 
-        btn_open_storage = QPushButton("打开物理存储")
+        btn_open_storage = QPushButton("打开目录")
         btn_open_storage.setFixedHeight(36)
         btn_open_storage.clicked.connect(self.action_open_storage)
-        action_bar.addWidget(btn_open_storage)
+        action_bar.addWidget(btn_open_storage, 1)
 
         layout.addLayout(action_bar)
 
         # 7. Safe Promise Footer
-        footer = QLabel("安全承诺：所有文件与快捷方式始终保存在旧版程序的原物理目录，大文件夹直接挂载该目录，"
-                        "不做重命名或迁移，随时可以双向切换。")
+        footer = QLabel("所有文件与快捷方式保留在原目录，不做重命名或迁移；随时可以切回。")
         footer.setWordWrap(True)
         footer.setFont(QFont("Segoe UI", 9))
         footer.setStyleSheet("color: #718096; line-height: 1.5;")
@@ -576,25 +595,25 @@ class LegacyMigrationDialog(CenteredDialog):
         self.env = detect_legacy_environment(self.window_manager)
 
         # Status text
-        inst_text = "已安装：" + self.env["exe_path"] if self.env["installed"] else "未检测到已安装的旧版程序"
+        inst_text = self.env["exe_path"] if self.env["installed"] else "未检测到"
         self.lbl_install.setText(f"<b>程序状态：</b>{inst_text}")
 
         if self.env["running"]:
             pids = ", ".join(str(p["pid"]) for p in self.env["processes"])
             self.lbl_proc.setText(f"<b>进程状态：</b><span style='color: #48bb78;'>运行中</span>（PID: {pids}）")
             self.btn_stop_proc.setEnabled(True)
-            self.btn_stop_proc.setText("安全退出旧版程序进程")
+            self.btn_stop_proc.setText("安全退出程序")
         else:
-            self.lbl_proc.setText("<b>进程状态：</b><span style='color: #a0aec0;'>未运行（已安全交接）</span>")
+            self.lbl_proc.setText("<b>进程状态：</b><span style='color: #a0aec0;'>未运行</span>")
             self.btn_stop_proc.setEnabled(False)
-            self.btn_stop_proc.setText("旧版程序已退出")
+            self.btn_stop_proc.setText("程序已退出")
 
-        self.lbl_storage.setText(f"<b>物理存储：</b>{self.env['storage_root']}"
+        self.lbl_storage.setText(f"<b>存储目录：</b>{self.env['storage_root']}"
                                  f"（共 {len(self.env['categories'])} 个分类）")
 
         auto_d = "开机自启" if self.env["autostart_legacy"] else "未自启"
         auto_b = "开机自启" if self.env["autostart_bigfolder"] else "未自启"
-        self.lbl_autostart.setText(f"<b>开机交接：</b>旧版程序 [{auto_d}] · 大文件夹 [{auto_b}]")
+        self.lbl_autostart.setText(f"<b>开机启动：</b>程序 [{auto_d}] · 大文件夹 [{auto_b}]")
 
         # Populate Category List
         self.list_widget.clear()
@@ -614,19 +633,21 @@ class LegacyMigrationDialog(CenteredDialog):
             cb.setChecked(not disp) # Check if not already on desktop
             cb.setEnabled(not disp)
             self.category_checkboxes[name] = cb
-            item_layout.addWidget(cb)
+            item_layout.addWidget(cb, 0, Qt.AlignmentFlag.AlignVCenter)
 
             item_layout.addStretch()
 
             count_lbl = QLabel(f"{count} 个项目")
-            count_lbl.setStyleSheet("color: #a0aec0; font-size: 11px;")
+            count_lbl.setFixedWidth(64)
+            count_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            count_lbl.setStyleSheet("color: #8b919b; font-size: 11px;")
             item_layout.addWidget(count_lbl)
 
-            status_lbl = QLabel("已在桌面" if disp else "待上屏")
-            if disp:
-                status_lbl.setStyleSheet("background-color: rgba(72, 187, 120, 40); color: #48bb78; border-radius: 4px; padding: 2px 6px; font-size: 11px;")
-            else:
-                status_lbl.setStyleSheet("background-color: rgba(237, 137, 54, 40); color: #ed8936; border-radius: 4px; padding: 2px 6px; font-size: 11px;")
+            status_lbl = QLabel("已添加" if disp else "未添加")
+            status_lbl.setFixedWidth(56)
+            status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            status_lbl.setStyleSheet(
+                "color: %s; font-size: 11px;" % ("#8b919b" if disp else "#c9a26a"))
             item_layout.addWidget(status_lbl)
 
             list_item = QListWidgetItem(self.list_widget)
@@ -661,14 +682,14 @@ class LegacyMigrationDialog(CenteredDialog):
             self.refresh_data()
             self.matrix_created.emit(created)
         else:
-            QMessageBox.information(self, "提示", "所选分类均已在桌面上。")
+            QMessageBox.information(self, "提示", "所选分类均已添加。")
 
     def action_stop_legacy(self):
         """Gracefully closes the legacy tool."""
         ret = QMessageBox.question(
             self,
-            "确认退出旧版程序",
-            "确定要安全退出正在运行的旧版程序进程吗？\n\n"
+            "确认退出程序",
+            "确定要安全退出正在运行的程序进程吗？\n\n"
             "所有文件均已直接由【Stacky 灵叠】接管显示，无任何文件丢失风险。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
@@ -690,7 +711,7 @@ class LegacyMigrationDialog(CenteredDialog):
             self,
             "自启动已切换",
             "已成功将系统开机自启切换为【Stacky 灵叠】！\n\n"
-            "旧版程序自启项已安全移除（如有需要随时可在此界面恢复）。"
+            "程序自启项已安全移除（如有需要随时可在此界面恢复）。"
         )
         self.refresh_data()
 

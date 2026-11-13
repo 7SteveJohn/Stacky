@@ -3,6 +3,9 @@ from stacky.paths import ROOT
 
 import os
 import sys
+import json
+import time
+import shutil
 import subprocess
 from typing import Optional, Dict, Any, List
 
@@ -58,6 +61,10 @@ def _nav_icon(kind: str) -> QIcon:
     elif kind == "widgets":
         for x, y in ((2.5, 2.5), (11, 2.5), (2.5, 11), (11, 11)):
             p.drawRoundedRect(QRectF(x, y, 6.5, 6.5), 1.5, 1.5)
+    elif kind == "backup":
+        p.drawRoundedRect(QRectF(2.5, 4.5, 15, 12), 2, 2)
+        p.drawLine(QPointF(2.5, 8.5), QPointF(17.5, 8.5))
+        p.drawLine(QPointF(7.5, 2.5), QPointF(12.5, 2.5))
     p.end()
     return QIcon(pm)
 
@@ -65,7 +72,7 @@ def _nav_icon(kind: str) -> QIcon:
 class NavItemDelegate(QStyledItemDelegate):
     """Raycast / Linear 式侧栏：分组标题 + 图标 + 主标题 + 描述副行。"""
 
-    GROUP_TITLES = {0: "桌面", 2: "个性化"}
+    GROUP_TITLES = {0: "桌面", 2: "个性化", 4: "数据"}
 
     def paint(self, painter, option, index):
         row = index.row()
@@ -541,6 +548,7 @@ class SettingsDialog(CenteredDialog):
             ("交互", "手势 · 快捷键 · 行为", "interaction"),
             ("外观", "主题 · 玻璃 · 显示密度", "appearance"),
             ("小组件", "天气 · 时钟 · 便签 · 搜索", "widgets"),
+            ("备份", "配置导入 · 导出 · 恢复", "backup"),
         )
         for title, desc, kind in nav_meta:
             item = QListWidgetItem(title)
@@ -566,6 +574,7 @@ class SettingsDialog(CenteredDialog):
         self.stack.addWidget(self._wrap_in_scroll(self._create_interaction_tab()))
         self.stack.addWidget(self._wrap_in_scroll(self._create_appearance_tab()))
         self.stack.addWidget(self._wrap_in_scroll(self._create_weather_tab()))
+        self.stack.addWidget(self._wrap_in_scroll(self._create_backup_tab()))
         content_box.addWidget(self.stack)
 
         # 3. 底部操作栏
@@ -1046,6 +1055,115 @@ class SettingsDialog(CenteredDialog):
             win.hide()
             win.close()
             mgr.file_shelf_window = None
+
+    def _create_backup_tab(self) -> QWidget:
+        page = QWidget()
+        box = QVBoxLayout(page)
+        box.setContentsMargins(0, 0, 22, 0)
+        box.setSpacing(14)
+
+        title = QLabel("备份")
+        title.setObjectName("pageTitle")
+        box.addWidget(title)
+
+        desc = QLabel("导出当前的卡片、布局、主题与组件位置。导入会覆盖现有配置，并在覆盖前自动备份。")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color: #8b919b; font-size: 12px;")
+        box.addWidget(desc)
+
+        card = SettingsCard("配置文件", page)
+
+        btn_export = QPushButton("导出…")
+        btn_export.setFixedWidth(96)
+        btn_export.clicked.connect(self._export_config)
+        card.add_row("导出配置", "保存为 JSON，可用于备份或换机", btn_export)
+
+        card.add_divider()
+
+        btn_import = QPushButton("导入…")
+        btn_import.setFixedWidth(96)
+        btn_import.clicked.connect(self._import_config)
+        card.add_row("导入配置", "覆盖当前布局，导入前自动备份", btn_import)
+
+        card.add_divider()
+
+        btn_dir = QPushButton("打开目录")
+        btn_dir.setFixedWidth(96)
+        btn_dir.clicked.connect(self._open_config_dir)
+        card.add_row("配置文件", "config.json", btn_dir)
+
+        box.addWidget(card)
+
+        # 完整路径单独一行并做中间省略：直接塞进设置行会撑宽整页，
+        # 把右侧操作按钮推到可视区之外。
+        path_lbl = QLabel()
+        path_lbl.setObjectName("rowDesc")
+        _path = self.config_manager.config_path
+        path_lbl.setText(path_lbl.fontMetrics().elidedText(
+            _path, Qt.TextElideMode.ElideMiddle, 520))
+        path_lbl.setToolTip(_path)
+        path_lbl.setStyleSheet("color: #8b919b; font-size: 11px;")
+        box.addWidget(path_lbl)
+
+        tip = QLabel("配置只包含界面与布局，不包含卡片内实际文件的内容。"
+                     "导入后需要重新打开 Stacky 才会全部生效。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #8b919b; font-size: 12px;")
+        box.addWidget(tip)
+        box.addStretch()
+        return page
+
+    def _export_config(self):
+        default = os.path.join(os.path.expanduser("~"), "Desktop",
+                               "stacky-config-%s.json" % time.strftime("%Y%m%d"))
+        path, _ = QFileDialog.getSaveFileName(self, "导出配置", default, "JSON 配置 (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.config_manager.data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, "导出完成", "配置已保存到：\n" + path)
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+
+    def _import_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "导入配置", "", "JSON 配置 (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", "无法读取 JSON：\n%s" % exc)
+            return
+        if not isinstance(data, dict) or not ({"folders", "instances", "theme"} & set(data)):
+            QMessageBox.warning(self, "导入失败", "这不是 Stacky 的配置文件。")
+            return
+        if QMessageBox.question(
+                self, "导入配置",
+                "导入会覆盖当前的卡片、布局与主题。\n导入前会自动备份现有配置，是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            backup = "%s.bak-%s" % (self.config_manager.config_path, time.strftime("%Y%m%d-%H%M%S"))
+            if os.path.exists(self.config_manager.config_path):
+                shutil.copy2(self.config_manager.config_path, backup)
+            self.config_manager.data = data
+            self.config_manager.save()
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        QMessageBox.information(
+            self, "导入完成",
+            "配置已导入。\n请退出并重新打开 Stacky，使卡片、主题与组件位置全部生效。")
+
+    def _open_config_dir(self):
+        folder = os.path.dirname(self.config_manager.config_path)
+        if folder and os.path.isdir(folder):
+            os.startfile(folder)
 
     def _create_weather_tab(self) -> QWidget:
         page = QWidget()
