@@ -1,0 +1,38 @@
+# ============================================================
+# 本机专用 / 不可上传。规则按「为什么不能传」分组。
+# ============================================================
+
+# 人工私密区：密钥、token、私人文件、配置备份、历史日志
+.private/
+
+# 用户配置：含桌面路径、文件夹结构、个人快捷方式清单
+config.json
+config.json.bak*
+
+# 运行时用户数据（程序按源码目录相对路径读取，不能移动）
+.desktop_memo.txt
+.desktop_todos.json
+.weather_areas.json
+.weather_cache.json
+.weather_cities.json
+.weather_geo.json
+
+# 本机图标缓存与工作区记忆（含用户名路径、私人备份）
+.cache_icons/
+.workbuddy/
+
+# 本机快捷方式与运行状态
+*.lnk
+run.pid
+*.log
+
+# 构建产物（体积大、可复现）
+build/
+build_pack*/
+dist/
+dist_pack*/
+__pycache__/
+*.py[cod]
+
+# 诊断脚本与截图（含本机绝对路径）
+scratch/
