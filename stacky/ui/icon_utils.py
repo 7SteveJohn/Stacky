@@ -1,3 +1,4 @@
+from stacky.paths import ROOT
 import os
 import sys
 import re
@@ -48,7 +49,7 @@ def get_default_icon_cache_dir() -> str:
             return portable_cache
         appdata_dir = os.path.join(os.environ.get("LOCALAPPDATA", exe_dir), "BigFolderLauncher")
         return os.path.join(appdata_dir, ".cache_icons")
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache_icons")
+    return os.path.join(ROOT, ".cache_icons")
 
 CACHE_DIR = get_default_icon_cache_dir()
 

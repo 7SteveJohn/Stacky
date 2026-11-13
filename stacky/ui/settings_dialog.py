@@ -1,4 +1,5 @@
 """Stacky 设置窗口：分类、交互、外观与桌面组件配置。"""
+from stacky.paths import ROOT
 
 import os
 import sys
@@ -1478,7 +1479,7 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "提示", "请先在上方勾选启用便签微件并点击【应用】。")
 
     def _on_clear_memo_clicked(self):
-        memo_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".desktop_memo.txt")
+        memo_file = os.path.join(ROOT, ".desktop_memo.txt")
         try:
             with open(memo_file, "w", encoding="utf-8") as f:
                 f.write("")

@@ -1,3 +1,4 @@
+from stacky.paths import ROOT
 import os
 import sys
 import winreg
@@ -15,7 +16,7 @@ def get_launch_command() -> str:
         pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.path.exists(pythonw):
             exe = pythonw
-    main_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "main.py"))
+    main_script = os.path.abspath(os.path.join(ROOT, "main.py"))
     return f'"{exe}" "{main_script}" --autostart'
 
 def is_autostart_enabled() -> bool:

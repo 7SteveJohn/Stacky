@@ -2,8 +2,17 @@
 
 
 a = Analysis(
-    ['d:/docker/main.py'],
-    pathex=[],
+    ['main.py'],
+    pathex=[
+        '.',
+        'stacky',
+        'stacky/core',
+        'stacky/widgets',
+        'stacky/media',
+        'stacky/services',
+        'stacky/ui',
+        'stacky/utils',
+    ],
     binaries=[],
     datas=[],
     hiddenimports=[

@@ -1,3 +1,4 @@
+from stacky.paths import ROOT
 import os
 import sys
 import json
@@ -26,7 +27,7 @@ def get_default_config_path() -> str:
                     pass
                 break
         return user_cfg
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    return os.path.join(ROOT, "config.json")
 
 CONFIG_FILE = get_default_config_path()
 

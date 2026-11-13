@@ -12,6 +12,7 @@ desktop_widgets.py - 超椭圆桌面小组件矩阵（移动端大厂风格）
 - 16px 智能磁吸网格对接 (与大文件夹平齐对齐)
 - 边缘 100% 透明穿透 (WM_NCHITTEST)
 """
+from stacky.paths import ROOT
 
 import os
 import sys
@@ -948,8 +949,8 @@ class MemoWidgetWindow(BaseDesktopWidgetWindow):
     def __init__(self, config_manager=None, parent=None):
         super().__init__(CARD_W_2X2, CARD_H_2X2, parent)
         self.config_manager = config_manager
-        self.memo_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".desktop_memo.txt")
-        self.todos_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".desktop_todos.json")
+        self.memo_file = os.path.join(ROOT, ".desktop_memo.txt")
+        self.todos_file = os.path.join(ROOT, ".desktop_todos.json")
         self.todos_data: List[Dict[str, Any]] = []
 
         self._init_ui()

@@ -1,3 +1,4 @@
+from stacky.paths import ROOT
 import os
 import time
 import sys
@@ -1643,7 +1644,7 @@ class BigFolderWindow(QWidget):
         if getattr(sys, "frozen", False):
             project_dir = os.path.dirname(os.path.abspath(sys.executable))
         else:
-            project_dir = os.path.dirname(os.path.abspath(__file__))
+            project_dir = ROOT
         desktop_dir = None
         create_desktop = True
         # Strict testing isolation: if running with isolated test config, don't pollute real Desktop

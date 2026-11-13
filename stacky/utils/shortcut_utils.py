@@ -1,3 +1,4 @@
+from stacky.paths import ROOT
 import os
 import sys
 import struct
@@ -257,7 +258,7 @@ def ensure_high_res_app_icon(project_dir: str = None, force: bool = False) -> st
         if getattr(sys, "frozen", False):
             project_dir = os.path.dirname(os.path.abspath(sys.executable))
         else:
-            project_dir = os.path.dirname(os.path.abspath(__file__))
+            project_dir = ROOT
     icon_path = os.path.join(project_dir, ".cache_icons", "app_icon.ico")
     png_path = os.path.join(project_dir, ".cache_icons", "app_icon.png")
     if force or not os.path.exists(icon_path) or not os.path.exists(png_path) or os.path.getsize(icon_path) < 10000:
@@ -378,7 +379,7 @@ def generate_mydock_shortcut(
         if getattr(sys, "frozen", False):
             project_dir = os.path.dirname(os.path.abspath(sys.executable))
         else:
-            project_dir = os.path.dirname(os.path.abspath(__file__))
+            project_dir = ROOT
 
     if getattr(sys, "frozen", False):
         target = sys.executable

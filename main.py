@@ -93,6 +93,8 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
+import stacky  # 把 stacky/* 子目录加入 sys.path，保持扁平导入可用
+
 from config_manager import ConfigManager
 from ui_kit import GLOBAL_QSS
 from main_window import BigFolderWindow, BigFolderWindowManager

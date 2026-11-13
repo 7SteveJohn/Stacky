@@ -3,6 +3,7 @@ weather_service.py - 实时气象服务引擎
 基于 Open-Meteo 公开免 Key 规范接口与 IP 自动定位，提供精准的天气数据获取与本地离线缓存。
 完全非阻塞后台线程池调度，零网络卡顿。
 """
+from stacky.paths import ROOT
 
 import json
 import os
@@ -58,7 +59,7 @@ POPULAR_CITIES: Dict[str, Dict[str, Any]] = {
     "台北": {"region": "台湾", "lat": 25.0330, "lon": 121.5654},
 }
 
-GEO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weather_geo.json")
+GEO_CACHE_FILE = os.path.join(ROOT, ".weather_geo.json")
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -68,7 +69,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * 6371.0 * asin(sqrt(a))
 
 
-AREAS_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weather_areas.json")
+AREAS_CACHE_FILE = os.path.join(ROOT, ".weather_areas.json")
 
 
 def _load_areas_cache() -> Dict[str, Any]:
@@ -116,7 +117,7 @@ def _datav_areas(adcode: int) -> list:
     return out
 
 
-CITY_INDEX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".weather_cities.json")
+CITY_INDEX_FILE = os.path.join(ROOT, ".weather_cities.json")
 _city_index_building = False
 _city_index_lock = threading.Lock()
 
@@ -368,7 +369,7 @@ class WeatherService(QObject):
     weather_updated = Signal(dict)
     weather_failed = Signal(str)
 
-    CACHE_FILE = os.path.join(os.path.dirname(__file__), ".weather_cache.json")
+    CACHE_FILE = os.path.join(ROOT, ".weather_cache.json")
 
     def __init__(self, parent=None):
         super().__init__(parent)

@@ -3,7 +3,7 @@
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "Stacky Desktop Labs"
 #define MyAppExeName "BigFolderLauncher.exe"
-#define SourceAppDir "d:\docker\dist\BigFolderLauncher"
+#define SourceAppDir "dist\BigFolderLauncher"
 
 [Setup]
 AppId={{8B3654E7-B647-4E9A-A37F-C8659101BC4F}}
@@ -19,9 +19,9 @@ DisableDirPage=auto
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 PrivilegesRequired=lowest
-OutputDir=d:\docker\dist
+OutputDir=dist
 OutputBaseFilename=Stacky-灵叠-安装程序
-SetupIconFile=d:\docker\.cache_icons\app_icon.ico
+SetupIconFile=.cache_icons\app_icon.ico
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
