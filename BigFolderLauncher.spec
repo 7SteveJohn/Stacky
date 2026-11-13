@@ -5,7 +5,8 @@ a = Analysis(
     ['main.py'],
     pathex=[
         '.',
-        'stacky',
+        # 不要把 'stacky' 加进来：否则 stacky/widgets/__init__.py 会被识别成
+        # 顶层 widgets 包，和 stacky/widgets/widgets.py 模块同名冲突。
         'stacky/core',
         'stacky/widgets',
         'stacky/media',
