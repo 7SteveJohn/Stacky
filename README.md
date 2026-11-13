@@ -2,7 +2,12 @@
 
 Windows 10 / 11 桌面视窗矩阵与应用启动台。把常用应用、文件夹和小组件收进桌面上的超椭圆卡片，保持桌面整洁，同时保留真实文件系统的访问方式。
 
-支持 Windows 10 / 11 x64 · Python 3.10+ · PySide6 / Qt · 本地优先
+<p>
+  <a href="#系统要求"><img alt="Windows 10 / 11 x64" src="https://img.shields.io/badge/Windows-10%20%7C%2011%20x64-blue?style=flat-square"></a>
+  <a href="https://www.python.org/downloads/"><img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-blueviolet?style=flat-square"></a>
+  <a href="https://doc.qt.io/qtforpython-6/"><img alt="PySide6 / Qt" src="https://img.shields.io/badge/GUI-PySide6%20%2F%20Qt-green?style=flat-square"></a>
+  <a href="#配置与数据"><img alt="Local-First" src="https://img.shields.io/badge/Storage-Local--First-orange?style=flat-square"></a>
+</p>
 
 ## 目录
 
