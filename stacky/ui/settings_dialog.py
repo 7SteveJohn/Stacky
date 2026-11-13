@@ -22,7 +22,7 @@ from config_manager import ConfigManager
 from weather_service import get_weather_service, POPULAR_CITIES, resolve_city_coordinates
 from autostart_utils import is_autostart_enabled, set_autostart
 from icon_utils import get_ui_chevron_icon_path, get_default_icon_cache_dir
-from ui_kit import FlatCheckBox, FlatRadioButton
+from ui_kit import CenteredDialog, FlatCheckBox, FlatRadioButton
 
 CACHE_DIR = get_default_icon_cache_dir()
 
@@ -191,7 +191,7 @@ class SettingsCard(QFrame):
         self.box.addWidget(div)
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(CenteredDialog):
     """设置对话框"""
 
     districts_loaded = Signal(list)
@@ -203,7 +203,6 @@ class SettingsDialog(QDialog):
         if window_manager is None:
             # 任意入口（含天气组件右键）打开设置时都自动接管窗口管理器，
             # 否则所有改动只写配置、不热生效，看起来像「改了没作用」。
-            from PySide6.QtWidgets import QApplication
             for top in QApplication.topLevelWidgets():
                 mgr = getattr(top, "manager", None)
                 if mgr is not None and hasattr(mgr, "windows"):
@@ -212,7 +211,16 @@ class SettingsDialog(QDialog):
         self.window_manager = window_manager
 
         self.setWindowTitle("Stacky 灵叠设置")
-        self.setFixedSize(880, 660)
+        # 常规屏幕用 880×660；小于该尺寸时等比收进可用区域，
+        # 页面内容由 QScrollArea 横向滚动兜底，避免窗口跑到屏幕外。
+        self.setMinimumSize(640, 480)
+        _screen = QApplication.primaryScreen()
+        if _screen is not None:
+            _avail = _screen.availableGeometry()
+            self.resize(min(880, max(640, _avail.width() - 16)),
+                        min(660, max(480, _avail.height() - 32)))
+        else:
+            self.resize(880, 660)
         self.setWindowFlags(Qt.WindowType.Window |
                             Qt.WindowType.WindowCloseButtonHint |
                             Qt.WindowType.WindowMinimizeButtonHint)
@@ -639,7 +647,8 @@ class SettingsDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 窄屏（可用宽度 < 880）时允许横向滚动，宁可滚也不要把右侧按钮裁掉
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setStyleSheet("QScrollArea { background: #1b1c1f; border: none; }")
         # viewport 与页面默认取系统 Base 色（浅色），显式统一为窗口底色，
@@ -1449,7 +1458,7 @@ class SettingsDialog(QDialog):
 
     def _on_open_migrator(self):
         if self.window_manager:
-            self.window_manager.open_legacy_migrator()
+            self.window_manager.open_legacy_migrator(parent=self)
 
     def _on_create_dock_shortcut(self):
         if self.window_manager:

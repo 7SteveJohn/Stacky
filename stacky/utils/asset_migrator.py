@@ -17,7 +17,7 @@ import ctypes
 from ctypes import wintypes
 from typing import List, Dict, Any, Optional, Tuple
 
-from PySide6.QtCore import Qt, QRect, QPoint, Signal
+from PySide6.QtCore import Qt, QRect, QPoint, QSize, Signal
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from storage_manager import default_managed_storage_root, scan_directory_items, normalize_fs_path
 from autostart_utils import is_autostart_enabled, set_autostart, APP_NAME as BIGFOLDER_APP_NAME
+from ui_kit import CenteredDialog
 
 
 # 旧版程序在系统中的真实注册表值名 / 进程名 / 安装路径，属于互操作标识，改名会检测不到
@@ -363,7 +364,7 @@ def create_desktop_cards_for_categories(window_manager, category_names: List[str
     return created
 
 
-class LegacyMigrationDialog(QDialog):
+class LegacyMigrationDialog(CenteredDialog):
     """
     Modern Squircle Liquid Glass Migration & Retirement Assistant Dialog.
     Allows user to:
@@ -378,8 +379,14 @@ class LegacyMigrationDialog(QDialog):
         super().__init__(parent)
         self.window_manager = window_manager
         self.setWindowTitle("旧版桌面工具资产迁移与协同管理")
-        self.setMinimumSize(620, 660)
-        self.resize(660, 760)
+        # 760 是常规高度；小屏按可用区域收缩，避免底部按钮跑出屏幕
+        self.setMinimumSize(620, 600)
+        _screen = QApplication.primaryScreen()
+        if _screen is not None:
+            _avail = _screen.availableGeometry()
+            self.resize(660, min(760, max(600, _avail.height() - 48)))
+        else:
+            self.resize(660, 760)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
@@ -599,8 +606,9 @@ class LegacyMigrationDialog(QDialog):
             disp = cat["displayed"]
 
             item_widget = QWidget()
+            item_widget.setFixedHeight(44)
             item_layout = QHBoxLayout(item_widget)
-            item_layout.setContentsMargins(6, 4, 6, 4)
+            item_layout.setContentsMargins(10, 0, 10, 0)
 
             cb = QCheckBox(f"{name}")
             cb.setChecked(not disp) # Check if not already on desktop
@@ -622,7 +630,7 @@ class LegacyMigrationDialog(QDialog):
             item_layout.addWidget(status_lbl)
 
             list_item = QListWidgetItem(self.list_widget)
-            list_item.setSizeHint(item_widget.sizeHint())
+            list_item.setSizeHint(QSize(0, 46))
             self.list_widget.addItem(list_item)
             self.list_widget.setItemWidget(list_item, item_widget)
 

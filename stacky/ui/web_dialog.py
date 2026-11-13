@@ -13,9 +13,10 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QIcon
 
 from icon_utils import extract_site_name_from_url, draw_bookmark_icon
+from ui_kit import CenteredDialog
 
 
-class AddWebBookmarkDialog(QDialog):
+class AddWebBookmarkDialog(CenteredDialog):
     """
     Sleek dark-acrylic dialog for adding or editing a web URL bookmark.
     Auto-detects URLs from clipboard, extracts domain names, provides subgroup picker.

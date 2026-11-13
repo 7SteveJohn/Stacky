@@ -3,9 +3,51 @@
 各窗口自己的 setStyleSheet 优先级更高；这里的规则用于覆盖那些没有局部 QSS 的
 对话框与弹窗（城市选择、输入对话框、文件对话框按钮等）。
 """
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath
-from PySide6.QtWidgets import QCheckBox, QRadioButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QRadioButton
+
+
+class CenteredDialog(QDialog):
+    """二级对话框基类：首次显示时居中于父窗口并置前。
+
+    直接从桌面主窗口派生 parent 会让对话框被上一级设置页/抽屉盖住，
+    必须按真正的调用方定位，并主动 raise + activate。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._centered_once = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._centered_once:
+            self._centered_once = True
+            QTimer.singleShot(0, self._center_on_parent)
+
+    def _center_on_parent(self):
+        parent = self.parentWidget()
+        screen = QApplication.primaryScreen()
+        if parent is not None:
+            parent_geo = parent.window().frameGeometry()
+            screen = QApplication.screenAt(parent_geo.center()) or screen
+        else:
+            parent_geo = None
+        avail = screen.availableGeometry() if screen else self.geometry()
+
+        # 父窗口比对话框还小时（例如从桌面小卡片打开设置），
+        # 以父窗口为中心会把对话框推出屏幕，此时直接居中到屏幕。
+        if parent_geo is not None and parent_geo.width() >= self.width() and parent_geo.height() >= self.height():
+            target = parent_geo.center() - self.rect().center()
+        else:
+            target = avail.center() - self.rect().center()
+
+        # 最后再钳一次，保证标题栏和底部按钮都在可用区域内
+        x = min(max(target.x(), avail.left() + 8), avail.right() - self.width() - 8)
+        y = min(max(target.y(), avail.top() + 8), avail.bottom() - self.height() - 8)
+        self.move(x, y)
+        self.raise_()
+        self.activateWindow()
 
 
 GLOBAL_QSS = """

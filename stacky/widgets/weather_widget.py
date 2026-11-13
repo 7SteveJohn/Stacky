@@ -27,7 +27,7 @@ import desktop_layer
 from grid_snap import get_all_desktop_card_rects
 from widget_grid import SnapDragMixin
 from icon_utils import create_squircle_path, get_ui_chevron_icon_path, draw_liquid_glass
-from ui_kit import FlatCheckBox
+from ui_kit import CenteredDialog, FlatCheckBox
 
 
 _EMOJI_FONT_OK = None
@@ -167,7 +167,7 @@ WIN_W_2X1 = CARD_W_2X1 + MARGIN_SHADOW * 2  # 296
 WIN_H_2X1 = CARD_H_2X1 + MARGIN_SHADOW * 2  # 168
 
 
-class CityPickerDialog(QDialog):
+class CityPickerDialog(CenteredDialog):
     """
     城市与地区切换对话框:
     - 快速选择热门城市 (成都、北京、上海、广州、深圳、重庆、杭州、武汉、南京、西安等)

@@ -2204,13 +2204,7 @@ class BigFolderWindow(QWidget):
 
 
     def action_open_asset_migrator(self):
-        try:
-            from legacy_migrator import LegacyMigrationDialog
-            dlg = LegacyMigrationDialog(window_manager=self.manager, parent=self)
-            dlg.matrix_created.connect(lambda cats: self.toast.show_message(f"已在桌面生成 {len(cats)} 个大文件夹"))
-            dlg.exec()
-        except Exception as e:
-            self.toast.show_message(f"打开挂载向导失败: {e}", is_error=True)
+        self.manager.open_asset_migrator(parent=self)
 
     def action_create_desktop_instance(self):
         all_folders = self.config_manager.get_folders()
@@ -3231,19 +3225,21 @@ class BigFolderWindowManager:
                 return w
         return next(iter(self.windows.values())) if self.windows else None
 
-    def open_asset_migrator(self):
+    def open_asset_migrator(self, parent=None):
         try:
             from legacy_migrator import LegacyMigrationDialog
-            primary = self.get_primary_window()
-            dlg = LegacyMigrationDialog(window_manager=self, parent=primary)
-            if primary and hasattr(primary, "toast"):
-                dlg.matrix_created.connect(lambda cats: primary.toast.show_message(f"已在桌面生成 {len(cats)} 个大文件夹"))
+            # 谁调用的就以谁为父窗口：从设置页进入时必须挂到设置页，
+            # 否则对话框会被设置页压在后面。
+            host = parent or self.get_primary_window()
+            dlg = LegacyMigrationDialog(window_manager=self, parent=host)
+            if host and hasattr(host, "toast"):
+                dlg.matrix_created.connect(lambda cats: host.toast.show_message(f"已在桌面生成 {len(cats)} 个大文件夹"))
             dlg.exec()
         except Exception as e:
             print("Failed to open asset migrator dialog:", e)
 
-    def open_legacy_migrator(self):
-        return self.open_asset_migrator()
+    def open_legacy_migrator(self, parent=None):
+        return self.open_asset_migrator(parent=parent)
 
     def open_settings_dialog(self, tab_index: int = 0):
         try:
