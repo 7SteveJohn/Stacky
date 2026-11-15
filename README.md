@@ -123,8 +123,8 @@ Windows 10 / 11 桌面视窗矩阵与应用启动台。把常用应用、文件�
 
 | 文件 | 说明 |
 |---|---|
-| `Stacky-1.0.1-Setup-x64.exe` | 安装版，按用户安装，自动创建开始菜单与桌面快捷方式 |
-| `Stacky-1.0.1-Portable-x64.zip` | 绿色便携版，解压后运行 `BigFolderLauncher.exe` |
+| `Stacky-1.0.2-Setup-x64.exe` | 安装版，按用户安装，自动创建开始菜单与桌面快捷方式 |
+| `Stacky-1.0.2-Portable-x64.zip` | 绿色便携版，解压后运行 `BigFolderLauncher.exe` |
 
 首次启动会在 `%APPDATA%\Stacky` 生成默认配置；启用物理分类后，会在 `%USERPROFILE%\Stacky` 下按需建立目录。
 

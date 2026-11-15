@@ -951,28 +951,38 @@ class FolderTitleLabel(QLabel):
     request_click = Signal(QPoint)
     request_open_drawer = Signal()
 
+    _QSS = """
+        QLabel {{
+            color: #ffffff;
+            font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
+            font-size: {fs}px;
+            font-weight: 500;
+            background-color: transparent;
+            padding: {pv}px {ph}px;
+            border-radius: {radius}px;
+            letter-spacing: 0.3px;
+        }}
+        QLabel:hover {{
+            background-color: rgba(255, 255, 255, 30);
+            border: 1px solid rgba(255, 255, 255, 45);
+        }}
+    """
+
     def __init__(self, text: str = "常用应用", parent=None):
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(24)
-        
-        self.setStyleSheet("""
-            QLabel {
-                color: #ffffff;
-                font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
-                font-size: 13px;
-                font-weight: 500;
-                background-color: transparent;
-                padding: 2px 14px;
-                border-radius: 11px;
-                letter-spacing: 0.3px;
-            }
-            QLabel:hover {
-                background-color: rgba(255, 255, 255, 30);
-                border: 1px solid rgba(255, 255, 255, 45);
-            }
-        """)
+        self.set_layout_scale(1.0)
+
+    def set_layout_scale(self, s: float):
+        """标题随桌面比例缩放，否则小屏下固定字号会把窗口撑得比卡片还宽。"""
+        self.setStyleSheet(self._QSS.format(
+            fs=max(8, int(round(13 * s))),
+            pv=max(1, int(round(2 * s))),
+            ph=max(2, int(round(14 * s))),
+            radius=max(4, int(round(11 * s)))))
+        self.setMinimumHeight(max(12, int(round(24 * s))))
+        self.adjustSize()
 
     def paintEvent(self, event):
         # 亮壁纸下纯白标题几乎不可见：自绘 1px 深色投影 + 白色前景（不是多层重影）

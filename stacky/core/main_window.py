@@ -31,6 +31,7 @@ from desktop_layer import DesktopWatchdog, pin_to_desktop, WM_NCHITTEST, HTTRANS
 from storage_manager import ManagedStorageEngine, default_managed_storage_root
 from grid_snap import calculate_magnetic_snap, get_all_desktop_card_rects, calculate_magnetic_resize, resolve_card_collision
 import widget_grid
+from stacky.core import layout_scale
 
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
@@ -173,6 +174,8 @@ class BigFolderWindow(QWidget):
         super().__init__()
         self.config_manager = config_manager
         self.manager = manager
+        # 布局以「保存时的屏幕」为画布，运行时等比换算到当前分辨率
+        self.layout_scale = layout_scale.scale_for_config(config_manager)
         self.drag_position = QPoint()
         self.mouse_press_global_pos = QPoint()
         self.is_moving_window = False
@@ -281,13 +284,15 @@ class BigFolderWindow(QWidget):
         self.setAcceptDrops(True)
 
     def init_ui(self):
+        s = self.layout_scale
         self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(18, 16, 18, 14)
-        self.main_layout.setSpacing(8)
+        self.main_layout.setContentsMargins(
+            *(layout_scale.to_screen(v, s) for v in (18, 16, 18, 14)))
+        self.main_layout.setSpacing(layout_scale.to_screen(8, s))
         self.main_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.setMouseTracking(True)
 
-        radius = self.config_manager.get("border_radius", 26)
+        radius = layout_scale.to_screen(self.config_manager.get("border_radius", 26), s)
         opacity = self.config_manager.get("opacity", 0.88)
         theme = self.config_manager.get("theme", "dark")
 
@@ -306,6 +311,7 @@ class BigFolderWindow(QWidget):
         # 2. Folder Title Label
         title_text = self.get_display_title_text()
         self.title_label = FolderTitleLabel(title_text, parent=self)
+        self.title_label.set_layout_scale(s)
         self.title_label.setToolTip("点击展开全景大文件夹 · 右键切换分类")
         self.title_label.request_click.connect(self.open_expanded_drawer)
         self.title_label.request_open_drawer.connect(self.open_expanded_drawer)
@@ -377,16 +383,21 @@ class BigFolderWindow(QWidget):
     def get_layout_state(self) -> dict:
         """布局与分页的唯一数据源：渲染、翻页、标题都从这里取，避免各算一套。"""
         default_rows, default_cols = self.get_grid_dimensions()
+        s = self.layout_scale
         saved_size = None
         if hasattr(self, "instance_id") and self.instance_id:
             inst = self.config_manager.get_instance(self.instance_id)
             if inst and inst.get("card_width") and inst.get("card_height"):
-                saved_size = QSize(int(inst["card_width"]), int(inst["card_height"]))
+                saved_size = QSize(layout_scale.to_screen(inst["card_width"], s),
+                                   layout_scale.to_screen(inst["card_height"], s))
         if saved_size:
-            # 拉过尺寸的卡片按可用空间自动排行列，与 rebuild_grid 完全同源
-            base = max(24, int(self.config_manager.get("slot_size", 62)))
-            cols = max(1, min(9, (saved_size.width() - 32 + 9) // (base + 9)))
-            rows = max(1, min(9, (saved_size.height() - 32 + 9) // (base + 9)))
+            # 拉过尺寸的卡片按可用空间自动排行列，与 rebuild_grid 完全同源。
+            # 尺寸、格子、内边距一起缩放，行列数才不会随分辨率改变而跳变。
+            base = layout_scale.to_screen(max(24, int(self.config_manager.get("slot_size", 62))), s)
+            pad = layout_scale.to_screen(32, s)
+            gap = max(4, layout_scale.to_screen(9, s))
+            cols = max(1, min(9, (saved_size.width() - pad + gap) // (base + gap)))
+            rows = max(1, min(9, (saved_size.height() - pad + gap) // (base + gap)))
         else:
             rows, cols = default_rows, default_cols
         slots = max(1, rows * cols)
@@ -436,15 +447,21 @@ class BigFolderWindow(QWidget):
         # 行列/页数全部来自唯一数据源，渲染与翻页不再各算一套
         state = self.get_layout_state()
         rows, cols, total_slots = state["rows"], state["cols"], state["slots"]
-        base_slot = self.config_manager.get("slot_size", 62)
-        base_icon = self.config_manager.get("icon_size", 46)
+        s = self.layout_scale
+        pad = layout_scale.to_screen(32, s)
+        gap = max(4, layout_scale.to_screen(9, s))
+        min_slot = max(12, layout_scale.to_screen(24, s))
+        base_slot = layout_scale.to_screen(self.config_manager.get("slot_size", 62), s)
+        base_icon = layout_scale.to_screen(self.config_manager.get("icon_size", 46), s)
+        self.card_layout.setSpacing(gap)
         slot_size = base_slot
         saved_size = state["saved_size"]
         if saved_size:
-            fit_w = (saved_size.width() - 32 - (cols - 1) * 9) // cols
-            fit_h = (saved_size.height() - 32 - (rows - 1) * 9) // rows
-            slot_size = max(24, min(fit_w, fit_h))
-        icon_size = max(16, int(base_icon * slot_size / max(1, base_slot)))
+            fit_w = (saved_size.width() - pad - (cols - 1) * gap) // cols
+            fit_h = (saved_size.height() - pad - (rows - 1) * gap) // rows
+            slot_size = max(min_slot, min(fit_w, fit_h))
+        icon_size = max(max(10, layout_scale.to_screen(16, s)),
+                        int(base_icon * slot_size / max(1, base_slot)))
         theme = self.config_manager.get("theme", "dark")
 
         # 格子间距恒为 9px；多余空间放到四周内边距，避免图标被拉开
@@ -535,12 +552,11 @@ class BigFolderWindow(QWidget):
         if saved_size:
             card_w, card_h = saved_size.width(), saved_size.height()
         else:
-            padding, spacing = 32, 9
-            card_w = cols * slot_size + (cols - 1) * spacing + padding
-            card_h = rows * slot_size + (rows - 1) * spacing + padding
-        # 余量均匀变成四周内边距，格子仍按 9px 紧密排列
-        used_w = cols * slot_size + (cols - 1) * 9
-        used_h = rows * slot_size + (rows - 1) * 9
+            card_w = cols * slot_size + (cols - 1) * gap + pad
+            card_h = rows * slot_size + (rows - 1) * gap + pad
+        # 余量均匀变成四周内边距，格子仍按缩放后的间距紧密排列
+        used_w = cols * slot_size + (cols - 1) * gap
+        used_h = rows * slot_size + (rows - 1) * gap
         extra_w, extra_h = max(0, card_w - used_w), max(0, card_h - used_h)
         ml, mt = extra_w // 2, extra_h // 2
         self.card_layout.setContentsMargins(ml, mt, extra_w - ml, extra_h - mt)
@@ -1084,12 +1100,7 @@ class BigFolderWindow(QWidget):
             remove_blur(hwnd)
 
     def restore_position(self):
-        """完全尊重用户保存的坐标，不做任何钳位、不写回 config。
-
-        旧实现把 min_y 硬钳到 32、按桌面图标区推 min_x，钳位结果还会
-        persist_instance_position 落盘，导致每次启动/更新布局都漂移。
-        换分辨率导致的出界由用户主动拖拽时自行修正。
-        """
+        """从 config 基准坐标换算到当前屏幕，不做钳位、不写回。"""
         inst = self.config_manager.get_instance(self.instance_id) if hasattr(self, "instance_id") and self.instance_id else None
         if inst:
             x = inst.get("pos_x", 797)
@@ -1097,7 +1108,16 @@ class BigFolderWindow(QWidget):
         else:
             x = self.config_manager.get("pos_x", 797)
             y = self.config_manager.get("pos_y", 49)
-        self.move(x, y)
+        self.move(layout_scale.to_screen(x, self.layout_scale),
+                  layout_scale.to_screen(y, self.layout_scale))
+
+    def set_layout_scale(self, scale: float, reposition: bool = True):
+        """分辨率变化后按新比例重建卡片：尺寸与坐标都从 config 基准重算，不累积误差。"""
+        self.layout_scale = scale
+        self.title_label.set_layout_scale(scale)
+        self.rebuild_grid()
+        if reposition:
+            self.restore_position()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1486,20 +1506,24 @@ class BigFolderWindow(QWidget):
             preview.hide()
 
     def persist_instance_position(self, x: int, y: int):
+        s = self.layout_scale
+        bx, by = layout_scale.to_canvas(x, s), layout_scale.to_canvas(y, s)
         if hasattr(self, "instance_id") and self.instance_id:
-            self.config_manager.update_instance(self.instance_id, {"pos_x": x, "pos_y": y})
+            self.config_manager.update_instance(self.instance_id, {"pos_x": bx, "pos_y": by})
         else:
-            self.config_manager.set("pos_x", x, auto_save=False)
-            self.config_manager.set("pos_y", y, auto_save=True)
+            self.config_manager.set("pos_x", bx, auto_save=False)
+            self.config_manager.set("pos_y", by, auto_save=True)
 
     def persist_instance_size(self, w: int, h: int):
-        """保存无极缩放后的实际像素尺寸（不再量化成固定行列格数）。"""
+        """保存无极缩放后的实际像素尺寸（反算回布局画布，不再量化成固定行列格数）。"""
+        s = self.layout_scale
+        bw, bh = layout_scale.to_canvas(w, s), layout_scale.to_canvas(h, s)
         if hasattr(self, "instance_id") and self.instance_id:
             self.config_manager.update_instance(
-                self.instance_id, {"card_width": int(w), "card_height": int(h)})
+                self.instance_id, {"card_width": bw, "card_height": bh})
         else:
-            self.config_manager.set("card_width", int(w), auto_save=False)
-            self.config_manager.set("card_height", int(h), auto_save=True)
+            self.config_manager.set("card_width", bw, auto_save=False)
+            self.config_manager.set("card_height", bh, auto_save=True)
 
     def align_to_adjacent_widget(self):
         """一键与最近的天气小组件或相邻大文件夹平齐对齐（顶边完全齐平，标准 16px 间距）"""
@@ -2307,8 +2331,8 @@ class BigFolderWindow(QWidget):
 
         new_inst = self.config_manager.add_instance(
             folder_name=target_name,
-            pos_x=new_x,
-            pos_y=new_y,
+            pos_x=layout_scale.to_canvas(new_x, self.layout_scale),
+            pos_y=layout_scale.to_canvas(new_y, self.layout_scale),
             locked=False
         )
 
@@ -2427,6 +2451,7 @@ class BigFolderWindowManager:
         self.file_shelf_window = None
         self.is_zen_hidden = False
         self._zen_saved_windows = []
+        self.layout_scale = 1.0
         self.desktop_blank_handler = desktop_layer.DesktopBlankDoubleClickHandler()
         self.desktop_blank_handler.desktop_blank_double_clicked.connect(self.toggle_zen_mode)
         if self.config_manager.is_double_click_desktop_hide_enabled():
@@ -2434,6 +2459,10 @@ class BigFolderWindowManager:
         self.shared_storage_engine = ManagedStorageEngine(self.config_manager)
 
     def start(self):
+        # 布局画布只记录一次：即用户保存这份布局时所在的屏幕可用区域。
+        # 之后任意分辨率都按它等比换算，画布本身不随远程会话漂移。
+        self._ensure_layout_canvas()
+        self.layout_scale = layout_scale.scale_for_config(self.config_manager)
         instances = self.config_manager.get_instances()
         if not instances:
             f_name = self.config_manager.get_active_folder_name()
@@ -2529,19 +2558,66 @@ class BigFolderWindowManager:
         # 只在用户主动「对齐 / 整理」时写回；屏幕变化只做临时避让（persist=False）。
         self.bind_all_widget_resizes()
         self._install_screen_watch()
+        if self.layout_scale != 1.0:
+            # 缩放后贴边卡片可能有几像素舍入越界，静默钳一次；不拆重叠、不写盘
+            size = layout_scale.current_screen_size()
+            if size:
+                self._clamp_once(QRect(0, 0, size[0], size[1]))
 
         # 首帧渲染完成后修剪一次工作集：PySide6 / WinRT 导入期与启动解包的冷页
         # 交回系统，任务管理器里的常驻内存从 ~260MB 降到 ~30MB，且不影响状态。
         QTimer.singleShot(3000, desktop_layer.trim_process_working_set)
 
+    def _layout_rects(self):
+        """config 里所有桌面元素的包围盒素材，仅用于首次推断布局画布。"""
+        cm = self.config_manager
+        rects = []
+        for inst in cm.get_instances():
+            rects.append((inst.get("pos_x", 797), inst.get("pos_y", 49),
+                          inst.get("card_width") or 320, inst.get("card_height") or 260))
+        for key in ("weather", "clock", "monitor", "memo", "media", "everything"):
+            getter = getattr(cm, f"get_{key}_config", None)
+            if getter is None:
+                continue
+            c = getter()
+            rects.append((c.get("x", 0), c.get("y", 0),
+                          c.get("width") or 310, c.get("height") or 226))
+        return rects
+
+    def _ensure_layout_canvas(self):
+        """首次运行记录布局画布，已有画布则不动，现有坐标零迁移。
+
+        在远程小分辨率下首次启动时，布局坐标会明显超出屏幕，此时按包围盒
+        还原它原本所属的画布，避免把小屏误当成基准。
+        """
+        cm = self.config_manager
+        if cm.get("layout_screen_w", 0) and cm.get("layout_screen_h", 0):
+            return
+        size = layout_scale.current_screen_size()
+        if size is None:
+            return
+        app = QApplication.instance()
+        # 无头自动化环境没有真实桌面，直接以虚拟屏幕为画布
+        if app is not None and app.platformName() == "offscreen":
+            canvas = size
+        else:
+            canvas = layout_scale.infer_canvas(self._layout_rects(), size)
+        cm.set("layout_screen_w", canvas[0], auto_save=False)
+        cm.set("layout_screen_h", canvas[1], auto_save=True)
+
+    def _widget_screen_pos(self, cfg, default_x: int, default_y: int):
+        s = self.layout_scale
+        return (layout_scale.to_screen(int(cfg.get("x", default_x)), s),
+                layout_scale.to_screen(int(cfg.get("y", default_y)), s))
 
     # ------------------------------------------------------------------
     # 小组件装配（天气 / 时钟 / 硬件 / 便签 / 播放器 / 中转站 / 搜索）
     # ------------------------------------------------------------------
     def init_weather_widget(self, cfg: Dict[str, Any]):
         from weather_widget import WeatherWidgetWindow
+        wx, wy = self._widget_screen_pos(cfg, 614, 180)
         win = WeatherWidgetWindow(
-            x=int(cfg.get("x", 614)), y=int(cfg.get("y", 180)),
+            x=wx, y=wy,
             theme=self.config_manager.get("theme", "dark"),
             widget_size=cfg.get("size", "2x2"),
             locked=bool(cfg.get("locked", False)),
@@ -2553,7 +2629,7 @@ class BigFolderWindowManager:
     def init_clock_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import ClockWidgetWindow
         win = ClockWidgetWindow(self.config_manager)
-        win.move(int(cfg.get("x", 300)), int(cfg.get("y", 180)))
+        win.move(*self._widget_screen_pos(cfg, 300, 180))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
             try:
@@ -2567,7 +2643,7 @@ class BigFolderWindowManager:
     def init_monitor_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import SystemMonitorWidgetWindow
         win = SystemMonitorWidgetWindow(self.config_manager)
-        win.move(int(cfg.get("x", 900)), int(cfg.get("y", 180)))
+        win.move(*self._widget_screen_pos(cfg, 900, 180))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
             try:
@@ -2581,7 +2657,7 @@ class BigFolderWindowManager:
     def init_memo_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import MemoWidgetWindow
         win = MemoWidgetWindow(self.config_manager)
-        win.move(int(cfg.get("x", 600)), int(cfg.get("y", 400)))
+        win.move(*self._widget_screen_pos(cfg, 600, 400))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
             try:
@@ -2595,7 +2671,7 @@ class BigFolderWindowManager:
     def init_media_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import NowPlayingWidgetWindow
         win = NowPlayingWidgetWindow(self.config_manager)
-        win.move(int(cfg.get("x", 1200)), int(cfg.get("y", 200)))
+        win.move(*self._widget_screen_pos(cfg, 1200, 200))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
             try:
@@ -2630,7 +2706,7 @@ class BigFolderWindowManager:
     def init_everything_widget(self, cfg: Dict[str, Any]):
         from everything_widget import EverythingWidgetWindow
         win = EverythingWidgetWindow(config_manager=self.config_manager)
-        win.move(int(cfg.get("x", 620)), int(cfg.get("y", 420)))
+        win.move(*self._widget_screen_pos(cfg, 620, 420))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
             try:
@@ -2641,36 +2717,31 @@ class BigFolderWindowManager:
         win.show()
         self.everything_window = win
 
-    # --- 位置回写 ---
-    def _on_weather_pos_changed(self, x: int, y: int):
-        cfg = self.config_manager.get_weather_config()
-        cfg["x"], cfg["y"] = int(x), int(y)
-        self.config_manager.set_weather_config(cfg)
+    # --- 位置回写：显示坐标反算回布局画布 ---
+    def _persist_widget_pos(self, key: str, x: int, y: int):
+        s = self.layout_scale
+        cfg = getattr(self.config_manager, f"get_{key}_config")()
+        cfg["x"] = layout_scale.to_canvas(x, s)
+        cfg["y"] = layout_scale.to_canvas(y, s)
+        getattr(self.config_manager, f"set_{key}_config")(cfg)
 
-    def _on_clock_pos_changed(self, x: int, y: int):
-        cfg = self.config_manager.get_clock_config()
-        cfg["x"], cfg["y"] = int(x), int(y)
-        self.config_manager.set_clock_config(cfg)
+    def _on_weather_pos_changed(self, x, y):
+        self._persist_widget_pos("weather", x, y)
 
-    def _on_monitor_pos_changed(self, x: int, y: int):
-        cfg = self.config_manager.get_monitor_config()
-        cfg["x"], cfg["y"] = int(x), int(y)
-        self.config_manager.set_monitor_config(cfg)
+    def _on_clock_pos_changed(self, x, y):
+        self._persist_widget_pos("clock", x, y)
 
-    def _on_memo_pos_changed(self, x: int, y: int):
-        cfg = self.config_manager.get_memo_config()
-        cfg["x"], cfg["y"] = int(x), int(y)
-        self.config_manager.set_memo_config(cfg)
+    def _on_monitor_pos_changed(self, x, y):
+        self._persist_widget_pos("monitor", x, y)
 
-    def _on_media_pos_changed(self, x: int, y: int):
-        cfg = self.config_manager.get_media_config()
-        cfg["x"], cfg["y"] = int(x), int(y)
-        self.config_manager.set_media_config(cfg)
+    def _on_memo_pos_changed(self, x, y):
+        self._persist_widget_pos("memo", x, y)
 
-    def _on_everything_pos_changed(self, x: int, y: int):
-        cfg = self.config_manager.get_everything_config()
-        cfg["x"], cfg["y"] = int(x), int(y)
-        self.config_manager.set_everything_config(cfg)
+    def _on_media_pos_changed(self, x, y):
+        self._persist_widget_pos("media", x, y)
+
+    def _on_everything_pos_changed(self, x, y):
+        self._persist_widget_pos("everything", x, y)
 
     def separate_overlapping_cards(self, persist: bool = True):
         """只把真正重合的桌面卡片推到相邻槽位，不动其它卡片已保存的布局。
@@ -2735,51 +2806,60 @@ class BigFolderWindowManager:
                 setter = getattr(self.config_manager, f"set_{_key}_config", None)
                 if getter and setter:
                     cfg = getter()
-                    cfg["width"], cfg["height"] = int(w), int(h)
+                    cfg["width"] = layout_scale.to_canvas(w, self.layout_scale)
+                    cfg["height"] = layout_scale.to_canvas(h, self.layout_scale)
                     setter(cfg)
+                    _win._layout_base_w = cfg["width"]
+                    _win._layout_base_h = cfg["height"]
                 # 换尺寸后卡片可能压到邻居或落在网格外，立刻按网格重新落位
                 self.snap_widget_to_grid(_win, _key)
 
             win.resized.connect(save)
             getter = getattr(self.config_manager, f"get_{key}_config", None)
-            if getter:
+            if getter and hasattr(win, "_update_window_size"):
                 cfg = getter()
                 w, h = cfg.get("width"), cfg.get("height")
-                if w and h and hasattr(win, "_update_window_size"):
-                    win.card_w, win.card_h = int(w), int(h)
-                    win._update_window_size()
-                    # 启动恢复尺寸时也必须走一次内容重排，否则布局/档位停留在默认档
-                    if hasattr(win, "on_card_resized"):
-                        win.on_card_resized()
+                # 没保存过尺寸的组件用出厂尺寸当基准，同样随分辨率缩放
+                base_w, base_h = (int(w), int(h)) if (w and h) else (win.card_w, win.card_h)
+                win._layout_base_w, win._layout_base_h = base_w, base_h
+                win.card_w = layout_scale.to_screen(base_w, self.layout_scale)
+                win.card_h = layout_scale.to_screen(base_h, self.layout_scale)
+                win._update_window_size()
+                # 启动恢复尺寸时也必须走一次内容重排，否则布局/档位停留在默认档
+                if hasattr(win, "on_card_resized"):
+                    win.on_card_resized()
 
     def _install_screen_watch(self):
-        """监听分辨率/远程会话变化：可用区域变了就把卡片重新钳位并拆开重叠。"""
+        """监听分辨率 / DPI / 远程会话变化：可用区域变了就整桌等比换算，越界才兜底钳位。"""
         app = QApplication.instance()
         if app is None:
             return
         self._last_screen_geo = None
         for scr in app.screens():
             scr.availableGeometryChanged.connect(self._on_screen_geometry_changed)
+            scr.geometryChanged.connect(self._on_screen_geometry_changed)
+            scr.logicalDotsPerInchChanged.connect(self._on_screen_geometry_changed)
         app.screenAdded.connect(self._on_screen_added)
         app.primaryScreenChanged.connect(self._on_screen_geometry_changed)
         primary = app.primaryScreen()
         if primary is not None:
-            # 只记录基准几何：启动不做钳位/重排，用户保存的桌面位置原样呈现
             self._last_screen_geo = primary.availableGeometry()
-        # 远程会话/锁屏有时不改几何，5 秒兜底检查一次越界
+        # 远程会话/锁屏有时不发几何信号，5 秒兜底检查一次越界
         self._clamp_timer = QTimer()
         self._clamp_timer.setInterval(5000)
         self._clamp_timer.timeout.connect(self._ensure_cards_in_screen)
         self._clamp_timer.start()
-        # 卡片尺寸要等 show/首帧后才稳定，延迟再钳一次
+        # 卡片尺寸要等 show/首帧后才稳定，延迟再检查一次
         QTimer.singleShot(1200, self._ensure_cards_in_screen)
 
     def _on_screen_added(self, screen):
         screen.availableGeometryChanged.connect(self._on_screen_geometry_changed)
+        screen.geometryChanged.connect(self._on_screen_geometry_changed)
+        screen.logicalDotsPerInchChanged.connect(self._on_screen_geometry_changed)
         self._on_screen_geometry_changed()
 
     def _on_screen_geometry_changed(self, *args):
-        # 远程桌面/切分辨率时信号会连发，防抖到一次重排
+        # 远程桌面/切分辨率时信号会连发，防抖到一次重算
         QTimer.singleShot(350, self._reflow_for_screen_change)
 
     def _widget_targets(self):
@@ -2799,9 +2879,9 @@ class BigFolderWindowManager:
                 new_x = max(avail.left(), min(win.x(), max_x))
                 new_y = max(avail.top(), min(win.y(), max_y))
                 if (new_x, new_y) != (win.x(), win.y()):
+                    # 临时避让只改显示；emit position_changed 会把远程分辨率下的
+                    # 避让坐标写回 config，用户原布局就再也回不去了。
                     win.move(new_x, new_y)
-                    if hasattr(win, "position_changed"):
-                        win.position_changed.emit(new_x, new_y)
             except Exception:
                 pass
 
@@ -2816,6 +2896,17 @@ class BigFolderWindowManager:
         # 卡片被重新排布后，压在上面的小组件要跟着让位（同样不写回用户布局）
         self.separate_widgets_from_cards(persist=False)
 
+    def _any_window_outside(self, avail):
+        for win in self._widget_targets():
+            try:
+                if (win.x() < avail.left() or win.y() < avail.top()
+                        or win.x() + win.width() > avail.right()
+                        or win.y() + win.height() > avail.bottom()):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _ensure_cards_in_screen(self):
         # 禅模式把卡片搬到了屏幕外，绝不能被钳位定时器拉回来
         if getattr(self, "is_zen_hidden", False):
@@ -2825,19 +2916,52 @@ class BigFolderWindowManager:
         if screen is None:
             return
         avail = screen.availableGeometry()
-        for win in self._widget_targets():
-            try:
-                if (win.x() < avail.left() or win.y() < avail.top()
-                        or win.x() + win.width() > avail.right()
-                        or win.y() + win.height() > avail.bottom()):
-                    self._clamp_all_to_screen(avail)
-                    self._last_screen_geo = avail
-                    return
-            except Exception:
-                continue
-        # 不再周期搬动小组件：用户自己排好的位置只有用户能改
+        if self._any_window_outside(avail):
+            self._clamp_all_to_screen(avail)
+            self._last_screen_geo = avail
 
-    def _reflow_for_screen_change(self):
+    def apply_layout_scale(self):
+        """按当前屏幕重算所有桌面元素的显示坐标与尺寸。
+
+        一律从 config 基准重新换算，不基于上一帧累乘，反复切分辨率无漂移；
+        用户在同一会话里手动摆过的位置已反算写回 config，重算不会丢。
+        """
+        new_s = layout_scale.scale_for_config(self.config_manager)
+        old_s = getattr(self, "layout_scale", 1.0) or 1.0
+        self.layout_scale = new_s
+        hidden = getattr(self, "is_zen_hidden", False)
+
+        for win in self.windows.values():
+            if hasattr(win, "set_layout_scale"):
+                win.set_layout_scale(new_s, reposition=not hidden)
+
+        for key, attr in (("weather", "weather_window"), ("clock", "clock_window"),
+                          ("monitor", "monitor_window"), ("memo", "memo_window"),
+                          ("media", "media_window"), ("everything", "everything_window")):
+            win = getattr(self, attr, None)
+            if win is None:
+                continue
+            cfg = getattr(self.config_manager, f"get_{key}_config")()
+            if not hidden:
+                win.move(layout_scale.to_screen(int(cfg.get("x", 0)), new_s),
+                         layout_scale.to_screen(int(cfg.get("y", 0)), new_s))
+            w = cfg.get("width") or getattr(win, "_layout_base_w", 0)
+            h = cfg.get("height") or getattr(win, "_layout_base_h", 0)
+            if w and h and hasattr(win, "_update_window_size"):
+                win.card_w = layout_scale.to_screen(int(w), new_s)
+                win.card_h = layout_scale.to_screen(int(h), new_s)
+                win._update_window_size()
+                if hasattr(win, "on_card_resized"):
+                    win.on_card_resized()
+
+        if hidden and old_s and new_s != old_s:
+            # 禅模式窗口在屏外，只换算记账坐标，退出时仍落回正确位置
+            ratio = new_s / old_s
+            self._zen_saved_positions = [
+                (w, int(round(x * ratio)), int(round(y * ratio)))
+                for w, x, y in getattr(self, "_zen_saved_positions", [])]
+
+    def _reflow_for_screen_change(self, *args):
         app = QApplication.instance()
         screen = app.primaryScreen() if app else None
         if screen is None:
@@ -2846,7 +2970,11 @@ class BigFolderWindowManager:
         if getattr(self, "_last_screen_geo", None) == avail:
             return
         self._last_screen_geo = avail
-        self._clamp_all_to_screen(avail)
+        self.apply_layout_scale()
+        # 等比缩放后相对布局不变；只有真的越界才做一次临时钳位，
+        # 否则拆分重叠会把用户摆好的位置搬动。
+        if self._any_window_outside(avail):
+            self._clamp_all_to_screen(avail)
 
     @staticmethod
     def _find_free_desktop_slot(size: QSize, occupied, avail: QRect, gap: int = 16,

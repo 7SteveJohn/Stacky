@@ -17,6 +17,8 @@ import ctypes
 from ctypes import wintypes
 from typing import List, Dict, Any, Optional, Tuple
 
+from stacky.core import layout_scale
+
 from PySide6.QtCore import Qt, QRect, QPoint, QSize, Signal
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush
 from PySide6.QtWidgets import (
@@ -358,7 +360,12 @@ def create_desktop_cards_for_categories(window_manager, category_names: List[str
             storage_engine.set_folder_storage_mapped(cat_name, True)
             storage_engine.sync_folder_from_storage(cat_name, force=True)
 
-        window_manager.create_instance(cat_name, pos_x, pos_y, locked=False)
+        s = getattr(window_manager, "layout_scale", 1.0)
+        window_manager.create_instance(
+            cat_name,
+            layout_scale.to_canvas(pos_x, s),
+            layout_scale.to_canvas(pos_y, s),
+            locked=False)
         created.append(cat_name)
 
     return created
