@@ -204,7 +204,10 @@ class SnapDragMixin:
     def _snap_update(self):
         """拖动中：只更新白色轮廓预览，窗口本身不动，避免每帧吸附抽搐。"""
         card = self._snap_card_rect()
-        target = drop_target(card, obstacles_for(exclude_window=self))
+        app = QApplication.instance()
+        scr = QApplication.screenAt(card.center()) if app is not None else None
+        avail = scr.availableGeometry() if scr is not None else available_geometry()
+        target = drop_target(card, obstacles_for(exclude_window=self), avail=avail)
         self._snap_target = target
         if self._snap_ghost is None:
             self._snap_ghost = DropOutline()
@@ -225,6 +228,18 @@ class SnapDragMixin:
     def _snap_hide(self):
         if self._snap_ghost is not None:
             self._snap_ghost.hide()
+
+    def _snap_cleanup(self):
+        ghost = getattr(self, "_snap_ghost", None)
+        self._snap_ghost = None
+        self._snap_target = None
+        if ghost is not None:
+            try:
+                ghost.hide()
+                ghost.close()
+                ghost.deleteLater()
+            except Exception:
+                pass
 
 
 class DropOutline(QWidget):
@@ -287,3 +302,7 @@ class DropOutline(QWidget):
         painter.setPen(QPen(QColor(255, 255, 255, 165), 2))
         painter.drawPath(path)
         painter.end()
+
+
+sys.modules.setdefault("widget_grid", sys.modules[__name__])
+sys.modules.setdefault("stacky.core.widget_grid", sys.modules[__name__])

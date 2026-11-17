@@ -2,11 +2,12 @@ import os
 import re
 import subprocess
 import ctypes
+from contextlib import contextmanager
 from ctypes import wintypes
 from typing import Dict, Any, List, Optional, Tuple
 
 from PySide6.QtCore import (
-    Qt, QPoint, QRect, QRectF, QSize, Signal, QEvent, QVariantAnimation, QEasingCurve, QTimer, QUrl, QMimeData
+    Qt, QPoint, QPointF, QRect, QRectF, QSize, Signal, QEvent, QVariantAnimation, QEasingCurve, QTimer, QUrl, QMimeData
 )
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QPen, QLinearGradient, QRadialGradient,
@@ -29,16 +30,56 @@ from search_utils import (
     search_items, safe_calculate_math, parse_web_quick_link,
     match_system_commands, execute_system_command, search_everything_files
 )
-from widgets import run_as_admin, show_file_properties
+from widgets import (
+    run_as_admin, show_file_properties, safe_launch_target,
+    _get_menu_qss, _is_admin_target, _paint_admin_shield, _is_drag_cancelled_by_user
+)
 from web_dialog import AddWebBookmarkDialog
 from ui_kit import theme_pick
 from PySide6.QtWidgets import QDialog
+
+
+def _ui_font(px: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    font = QFont("Segoe UI Variable Text")
+    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI"])
+    font.setPixelSize(max(1, int(px)))
+    font.setWeight(weight)
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+    return font
+
+
+def _clean_item_tooltip(name: str, path: str) -> str:
+    clean_name = (name or "").strip()
+    raw_path = (path or "").strip()
+    url_str = ""
+    if raw_path.startswith(("http://", "https://")):
+        url_str = raw_path
+    elif raw_path.lower().endswith(".url"):
+        url_str = resolve_url_shortcut(raw_path) or ""
+    host = QUrl(url_str).host() if url_str.startswith(("http://", "https://")) else ""
+    if not clean_name and raw_path:
+        clean_name = host or os.path.splitext(os.path.basename(raw_path))[0]
+    if host and clean_name and host.lower() != clean_name.lower():
+        return f"{clean_name}\n{host}"
+    return clean_name
 
 
 def _drawer_theme(widget) -> str:
     """抽屉自绘控件从所属顶层覆盖层读主题；不在抽屉内时按深色处理。"""
     owner = widget.window() if widget is not None else None
     return getattr(owner, "theme", "dark")
+
+
+@contextmanager
+def _drawer_modal_guard(widget):
+    """临时挂起抽屉失焦自动收起，防止原生文件选择器 / 子弹窗激活时把抽屉在底下意外关闭。"""
+    owner = widget.window() if widget is not None else None
+    guard_fn = getattr(owner, "_modal_guard", None)
+    if callable(guard_fn):
+        with guard_fn():
+            yield
+        return
+    yield
 
 
 def _ink(widget, light, dark):
@@ -62,13 +103,15 @@ def recolor_qss(qss: str, color: str) -> str:
 
 class ModernInputDialog(QDialog):
     """
-    超椭圆液态玻璃输入弹窗:
-    - 强制 Qt.WindowType.WindowStaysOnTopHint 置顶，100% 杜绝被无边框全屏覆盖层或全景抽屉遮挡;
-    - 居中对齐至屏幕几何中心，纯 QPainter 连续曲率超椭圆磨砂底板;
+    超椭圆磨砂玻璃输入弹窗:
+    - 强制 Qt.WindowType.WindowStaysOnTopHint 置顶，避免被无边框覆盖层遮挡;
+    - 居中对齐至屏幕几何中心，纯 QPainter 连续曲率超椭圆磨砂底板 (自适应浅色/深色主题);
     - 弹出后立即聚焦输入框并全选文本，按回车直接提交，按 Esc 直接取消。
     """
-    def __init__(self, title: str, prompt: str, text: str = "", placeholder: str = "", parent=None):
-        super().__init__(parent)
+    def __init__(self, title: str, prompt: str, text: str = "", placeholder: str = "",
+                 parent=None, theme: Optional[str] = None):
+        super().__init__(None)
+        self._anchor_parent = parent
         self.setWindowTitle(title)
         self.setFixedSize(380, 210)
         self.setWindowFlags(
@@ -80,20 +123,37 @@ class ModernInputDialog(QDialog):
 
         self._title = title
         self._prompt = prompt
+        if theme is not None:
+            self.theme = theme
+        elif parent is not None:
+            self.theme = getattr(parent, "theme", None) or _drawer_theme(parent)
+        else:
+            self.theme = "dark"
+        is_light = (self.theme == "light")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setContentsMargins(26, 22, 26, 22)
         layout.setSpacing(12)
 
         # 标题
         lbl_title = QLabel(title, self)
-        lbl_title.setStyleSheet("color: #ffffff; font-size: 16px; font-weight: 700; font-family: 'Segoe UI Variable Display', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei';")
+        lbl_title.setFont(_ui_font(16, QFont.Weight.DemiBold))
+        title_fg = "#0f172a" if is_light else "#f8fafc"
+        lbl_title.setStyleSheet(
+            f"color: {title_fg}; font-size: 16px; font-weight: 600;"
+            " font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';"
+        )
         layout.addWidget(lbl_title)
 
         # 说明提示文案
         lbl_prompt = QLabel(prompt, self)
         lbl_prompt.setWordWrap(True)
-        lbl_prompt.setStyleSheet("color: #94a3b8; font-size: 13px; font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei';")
+        lbl_prompt.setFont(_ui_font(13, QFont.Weight.Normal))
+        prompt_fg = "#475569" if is_light else "#94a3b8"
+        lbl_prompt.setStyleSheet(
+            f"color: {prompt_fg}; font-size: 13px;"
+            " font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';"
+        )
         layout.addWidget(lbl_prompt)
 
         # 现代输入框
@@ -101,25 +161,47 @@ class ModernInputDialog(QDialog):
         self.input_edit.setText(text)
         self.input_edit.setPlaceholderText(placeholder)
         self.input_edit.setFixedHeight(38)
-        self.input_edit.setStyleSheet("""
-            QLineEdit {
-                background-color: rgba(255, 255, 255, 0.08);
-                color: #ffffff;
-                border: 1px solid rgba(255, 255, 255, 0.20);
-                border-radius: 8px;
-                padding: 6px 12px;
-                font-size: 14px;
-                font-family: 'Segoe UI Variable Display', 'Segoe UI', 'Microsoft YaHei';
-            }
-            QLineEdit:hover {
-                background-color: rgba(255, 255, 255, 0.12);
-                border-color: rgba(255, 255, 255, 0.35);
-            }
-            QLineEdit:focus {
-                background-color: rgba(255, 255, 255, 0.14);
-                border: 1.5px solid #3b82f6;
-            }
-        """)
+        self.input_edit.setFont(_ui_font(14, QFont.Weight.Normal))
+        if is_light:
+            self.input_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: rgba(15, 23, 42, 0.045);
+                    color: #0f172a;
+                    border: 1px solid rgba(15, 23, 42, 0.14);
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 14px;
+                    font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';
+                }
+                QLineEdit:hover {
+                    background-color: rgba(15, 23, 42, 0.07);
+                    border-color: rgba(15, 23, 42, 0.22);
+                }
+                QLineEdit:focus {
+                    background-color: #ffffff;
+                    border: 1px solid rgba(59, 130, 246, 0.65);
+                }
+            """)
+        else:
+            self.input_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: rgba(255, 255, 255, 0.06);
+                    color: #f8fafc;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    border-radius: 10px;
+                    padding: 6px 12px;
+                    font-size: 14px;
+                    font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';
+                }
+                QLineEdit:hover {
+                    background-color: rgba(255, 255, 255, 0.09);
+                    border-color: rgba(255, 255, 255, 0.20);
+                }
+                QLineEdit:focus {
+                    background-color: rgba(255, 255, 255, 0.10);
+                    border: 1px solid rgba(59, 130, 246, 0.65);
+                }
+            """)
         layout.addWidget(self.input_edit)
 
         # 按钮栏
@@ -129,36 +211,57 @@ class ModernInputDialog(QDialog):
 
         btn_cancel = QPushButton("取消", self)
         btn_cancel.setFixedSize(80, 32)
-        btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 255, 255, 0.08);
-                color: #e2e8f0;
-                border: 1px solid rgba(255, 255, 255, 0.15);
-                border-radius: 8px;
-                font-size: 13px;
-                font-weight: 500;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 255, 255, 0.15);
-                color: #ffffff;
-            }
-        """)
+        btn_cancel.setFont(_ui_font(13, QFont.Weight.Medium))
+        if is_light:
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(15, 23, 42, 0.05);
+                    color: #334155;
+                    border: 1px solid rgba(15, 23, 42, 0.10);
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: 500;
+                    font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';
+                }
+                QPushButton:hover {
+                    background-color: rgba(15, 23, 42, 0.10);
+                    color: #0f172a;
+                }
+            """)
+        else:
+            btn_cancel.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(255, 255, 255, 0.06);
+                    color: #cbd5e1;
+                    border: 1px solid rgba(255, 255, 255, 0.10);
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: 500;
+                    font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';
+                }
+                QPushButton:hover {
+                    background-color: rgba(255, 255, 255, 0.12);
+                    color: #ffffff;
+                }
+            """)
         btn_cancel.clicked.connect(self.reject)
         btn_layout.addWidget(btn_cancel)
 
         btn_ok = QPushButton("确定", self)
         btn_ok.setFixedSize(80, 32)
+        btn_ok.setFont(_ui_font(13, QFont.Weight.DemiBold))
         btn_ok.setStyleSheet("""
             QPushButton {
-                background-color: #2563eb;
+                background-color: #3b82f6;
                 color: #ffffff;
                 border: none;
                 border-radius: 8px;
                 font-size: 13px;
                 font-weight: 600;
+                font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI';
             }
             QPushButton:hover {
-                background-color: #3b82f6;
+                background-color: #2563eb;
             }
             QPushButton:pressed {
                 background-color: #1d4ed8;
@@ -169,29 +272,45 @@ class ModernInputDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
-        # 居中屏幕
-        screen = QApplication.primaryScreen()
+        # 多显示器与任务栏安全居中
+        screen = None
+        if parent is not None:
+            try:
+                p_geo = parent.window().frameGeometry()
+                screen = QApplication.screenAt(p_geo.center())
+            except Exception:
+                screen = None
+        if screen is None:
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
-            self.move((geo.width() - self.width()) // 2, (geo.height() - self.height()) // 2)
+            self.move(
+                geo.left() + (geo.width() - self.width()) // 2,
+                geo.top() + (geo.height() - self.height()) // 2,
+            )
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = self.rect()
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
         path = create_squircle_path(rect, 20.0)
 
-        # 现代液态黑曜石磨砂底板
         grad = QLinearGradient(0, 0, 0, self.height())
-        grad.setColorAt(0.0, QColor(28, 32, 44, 252))
-        grad.setColorAt(1.0, QColor(16, 18, 26, 254))
-        painter.fillPath(path, grad)
-
-        # 迎光面菲涅尔微边框
-        pen_grad = QLinearGradient(0, 0, self.width(), self.height())
-        pen_grad.setColorAt(0.0, QColor(255, 255, 255, 80))
-        pen_grad.setColorAt(1.0, QColor(255, 255, 255, 20))
-        painter.strokePath(path, QPen(pen_grad, 1.0))
+        if self.theme == "light":
+            grad.setColorAt(0.0, QColor(251, 252, 255, 252))
+            grad.setColorAt(1.0, QColor(243, 246, 251, 254))
+            painter.fillPath(path, grad)
+            painter.strokePath(path, QPen(QColor(15, 23, 42, 24), 1.0))
+        elif self.theme == "oled":
+            grad.setColorAt(0.0, QColor(16, 17, 23, 252))
+            grad.setColorAt(1.0, QColor(9, 10, 14, 254))
+            painter.fillPath(path, grad)
+            painter.strokePath(path, QPen(QColor(255, 255, 255, 32), 1.0))
+        else:
+            grad.setColorAt(0.0, QColor(22, 24, 31, 248))
+            grad.setColorAt(1.0, QColor(15, 17, 23, 252))
+            painter.fillPath(path, grad)
+            painter.strokePath(path, QPen(QColor(255, 255, 255, 36), 1.0))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -199,8 +318,9 @@ class ModernInputDialog(QDialog):
         self.input_edit.selectAll()
 
     @classmethod
-    def getText(cls, parent, title: str, prompt: str, text: str = "", placeholder: str = "") -> Tuple[str, bool]:
-        dlg = cls(title=title, prompt=prompt, text=text, placeholder=placeholder, parent=parent)
+    def getText(cls, parent, title: str, prompt: str, text: str = "", placeholder: str = "",
+                theme: Optional[str] = None) -> Tuple[str, bool]:
+        dlg = cls(title=title, prompt=prompt, text=text, placeholder=placeholder, parent=parent, theme=theme)
         res = dlg.exec()
         if res == QDialog.DialogCode.Accepted:
             return dlg.input_edit.text().strip(), True
@@ -247,6 +367,7 @@ class MobileExpandedItemWidget(QWidget):
         name = self.item_data.get("name", "")
         custom_icon = self.item_data.get("custom_icon", "")
         self._cached_pixmap = get_app_icon_pixmap(path_str, name, target_size=128, custom_icon_path=custom_icon)
+        self._scaled_pixmap = None
 
         self.scale_factor: float = 1.0
         self.glow_alpha: float = 0.0
@@ -262,9 +383,9 @@ class MobileExpandedItemWidget(QWidget):
         self.update_tooltip()
 
     def update_tooltip(self):
-        name = self.item_data.get("name", "未命名应用")
+        name = self.item_data.get("name", "")
         path = self.item_data.get("path", "")
-        self.setToolTip(f"<div style='font-family: Segoe UI, PingFang SC, Microsoft YaHei;'><b>{name}</b><br><span style='color:#bbb; font-size:11px;'>{path}</span></div>")
+        self.setToolTip(_clean_item_tooltip(name, path))
 
     def _animate_scale(self, target: float, duration: int, easing: QEasingCurve.Type = QEasingCurve.Type.OutCubic):
         self.scale_anim.stop()
@@ -380,8 +501,12 @@ class MobileExpandedItemWidget(QWidget):
 
         custom_icon = self.item_data.get("custom_icon", "")
         pix = get_app_icon_pixmap(real_path, self.item_data.get("name", ""), 64, custom_icon_path=custom_icon)
-        if pix:
-            drag.setPixmap(pix.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if pix and not pix.isNull():
+            dpr = max(1.0, float(self.devicePixelRatioF() or 1.0))
+            px_sz = max(16, int(round(48 * dpr)))
+            drag_pm = pix.scaled(px_sz, px_sz, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            drag_pm.setDevicePixelRatio(dpr)
+            drag.setPixmap(drag_pm)
             drag.setHotSpot(QPoint(24, 24))
 
         self.is_pressed = False
@@ -400,6 +525,8 @@ class MobileExpandedItemWidget(QWidget):
             overlay._internal_drawer_drag_handled = False
 
         if not was_internal:
+            if action == Qt.DropAction.IgnoreAction and _is_drag_cancelled_by_user():
+                return
             # Dropped outside the drawer (e.g. onto Windows Desktop or Explorer)
             sheet = getattr(overlay, "sheet", None)
             sheet_contains = sheet.geometry().contains(overlay.mapFromGlobal(QCursor.pos())) if sheet else False
@@ -413,47 +540,60 @@ class MobileExpandedItemWidget(QWidget):
 
         w = float(self.width())
         h = float(self.height())
+        is_light = (_drawer_theme(self) == "light")
 
         # 1. Selection / Hover squircle background
         back_rect = QRectF(3, 3, w - 6, h - 6)
         back_path = create_squircle_path(back_rect, 18)
+        glow = max(0.0, min(1.0, float(self.glow_alpha)))
 
         if self.is_selected:
-            painter.fillPath(back_path, QColor(60, 140, 255, 75))
-            painter.strokePath(back_path, QPen(QColor(100, 175, 255, 180), 1.2))
-        elif self.glow_alpha > 0.01 or self.is_pressed:
-            alpha = int(35 * self.glow_alpha) if not self.is_pressed else 45
-            stroke_alpha = int(55 * self.glow_alpha) if not self.is_pressed else 75
-            painter.fillPath(back_path, QColor(255, 255, 255, alpha))
-            painter.strokePath(back_path, QPen(QColor(255, 255, 255, stroke_alpha), 0.8))
+            painter.fillPath(back_path, QColor(37, 99, 235, 31) if is_light else QColor(59, 130, 246, 56))
+            painter.strokePath(back_path, QPen(QColor(59, 130, 246, 95) if is_light else QColor(96, 165, 250, 115), 1.0))
+        elif glow > 0.01 or self.is_pressed:
+            if is_light:
+                if self.is_pressed:
+                    painter.fillPath(back_path, QColor(15, 23, 42, 22))
+                    painter.strokePath(back_path, QPen(QColor(15, 23, 42, 32), 0.8))
+                else:
+                    painter.fillPath(back_path, QColor(255, 255, 255, int(150 * glow)))
+                    painter.strokePath(back_path, QPen(QColor(15, 23, 42, int(20 * glow)), 0.8))
+            else:
+                if self.is_pressed:
+                    painter.fillPath(back_path, QColor(255, 255, 255, 38))
+                    painter.strokePath(back_path, QPen(QColor(255, 255, 255, 55), 0.8))
+                else:
+                    grad = QLinearGradient(0, 3, 0, h - 3)
+                    grad.setColorAt(0.0, QColor(255, 255, 255, int(32 * glow)))
+                    grad.setColorAt(1.0, QColor(255, 255, 255, int(14 * glow)))
+                    painter.fillPath(back_path, grad)
+                    painter.strokePath(back_path, QPen(QColor(255, 255, 255, int(42 * glow)), 0.8))
 
-        # 2. Draw App Icon with dynamic display mode scaling
+        # 2. 120Hz Sub-Pixel Floating-Point Icon Scaling (zero per-tick pix.scaled staircase!)
         disp_mode = getattr(self, "display_mode", "classic")
         if disp_mode == "large_icon":
-            base_icon_sz = 62.0
-            target_sz = int(base_icon_sz * self.scale_factor)
-            target_sz = max(20, min(target_sz, int(w - 6)))
-            x = (w - target_sz) / 2.0
-            y = (h - target_sz) / 2.0
+            base_icon_sz = min(62.0, w - 6.0)
+            cx = w / 2.0
+            cy = h / 2.0
         elif disp_mode == "two_line":
-            base_icon_sz = 44.0
-            target_sz = int(base_icon_sz * self.scale_factor)
-            target_sz = max(18, min(target_sz, int(w - 6)))
-            x = (w - target_sz) / 2.0
-            y = 6 + (base_icon_sz - target_sz) / 2.0
+            base_icon_sz = min(44.0, w - 6.0)
+            cx = w / 2.0
+            cy = 6.0 + base_icon_sz / 2.0
         else:  # classic
-            base_icon_sz = 52.0
-            target_sz = int(base_icon_sz * self.scale_factor)
-            target_sz = max(20, min(target_sz, int(w - 6)))
-            x = (w - target_sz) / 2.0
-            y = 8 + (base_icon_sz - target_sz) / 2.0
+            base_icon_sz = min(52.0, w - 6.0)
+            cx = w / 2.0
+            cy = 8.0 + base_icon_sz / 2.0
 
-        # Ambient diffuse soft shadow under squircle icon (zero hard-edge burrs)
-        base_alpha = int(24 + 16 * self.glow_alpha)
+        eff_sz = max(18.0, min(base_icon_sz * self.scale_factor, w - 4.0))
+        sx = cx - eff_sz / 2.0
+        sy = cy - eff_sz / 2.0
+
+        # Ambient diffuse soft shadow under squircle icon (sub-pixel floating-point QRectF)
+        base_alpha = int((14 if is_light else 24) + (10 if is_light else 16) * self.glow_alpha)
         for s_inset, s_dy, s_a in [(0.0, 3.0, int(base_alpha * 0.25)), (1.0, 2.0, int(base_alpha * 0.45)), (2.0, 1.0, base_alpha)]:
-            s_rect = QRectF(x + s_inset, y + s_dy, target_sz - s_inset * 2, target_sz - s_inset * 2)
-            s_path = create_squircle_path(s_rect, target_sz * 0.22)
-            painter.fillPath(s_path, QColor(0, 0, 0, s_a))
+            s_rect = QRectF(sx + s_inset, sy + s_dy, eff_sz - s_inset * 2.0, eff_sz - s_inset * 2.0)
+            s_path = create_squircle_path(s_rect, eff_sz * 0.22)
+            painter.fillPath(s_path, QColor(15, 23, 42, s_a) if is_light else QColor(0, 0, 0, s_a))
 
         path_str = self.item_data.get("path", "")
         name = self.item_data.get("name", "")
@@ -461,60 +601,53 @@ class MobileExpandedItemWidget(QWidget):
             custom_icon = self.item_data.get("custom_icon", "")
             self._cached_pixmap = get_app_icon_pixmap(path_str, name, target_size=128, custom_icon_path=custom_icon)
         pix = self._cached_pixmap
+        draw_w = draw_h = base_icon_sz
         if pix and not pix.isNull():
-            sp = pix.scaled(target_sz, target_sz,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation)
-            painter.drawPixmap(int(x + (target_sz - sp.width()) / 2.0),
-                               int(y + (target_sz - sp.height()) / 2.0), sp)
+            pw, ph = float(pix.width()), float(pix.height())
+            if pw > 0 and ph > 0:
+                ratio = min(base_icon_sz / pw, base_icon_sz / ph)
+                draw_w = pw * ratio
+                draw_h = ph * ratio
+            painter.save()
+            painter.translate(cx, cy)
+            painter.scale(self.scale_factor, self.scale_factor)
+            painter.drawPixmap(
+                QRectF(-draw_w / 2.0, -draw_h / 2.0, draw_w, draw_h),
+                pix,
+                QRectF(pix.rect()),
+            )
+            painter.restore()
 
-        # Smart Badges: Admin Shield Badge
-        if getattr(self, "show_admin_badge", True):
-            lower_p = path_str.lower()
-            is_admin_app = any(k in lower_p for k in ["regedit", "taskmgr", "cmd.exe", "powershell", "terminal", "mmc.exe"])
-            if is_admin_app:
-                bx = int(x + target_sz - 14)
-                by = int(y + target_sz - 14)
-                shield_rect = QRectF(bx, by, 14, 14)
-                shield_path = create_squircle_path(shield_rect, 4.0)
-                painter.fillPath(shield_path, QColor(245, 158, 11, 230))
-                painter.strokePath(shield_path, QPen(QColor(255, 255, 255, 210), 1.0))
+        # Smart Badges: Vector Two-Tone Admin Shield Badge
+        if getattr(self, "show_admin_badge", True) and _is_admin_target(path_str):
+            eff_w = draw_w * self.scale_factor
+            eff_h = draw_h * self.scale_factor
+            shield_sz = 14.0
+            bx = cx + eff_w / 2.0 - shield_sz + 1.5
+            by = cy + eff_h / 2.0 - shield_sz + 1.5
+            _paint_admin_shield(painter, QRectF(bx, by, shield_sz, shield_sz))
 
         # 3. Typography Labeling
         if disp_mode == "large_icon":
-            # Immersive Large Icon mode hides text completely, giving a clean large-icon look
             pass
         elif disp_mode == "two_line":
-            font1 = QFont("Microsoft YaHei UI", 9, QFont.Weight.DemiBold)
-            font1.setFamilies(["Microsoft YaHei UI", "PingFang SC", "Segoe UI Variable Text", "Segoe UI"])
-            font1.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
-            painter.setFont(font1)
+            painter.setFont(_ui_font(12, QFont.Weight.DemiBold))
             painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 245)))
             fm1 = painter.fontMetrics()
             elided1 = fm1.elidedText(name, Qt.TextElideMode.ElideRight, int(w - 8))
             painter.drawText(QRectF(4, 54, w - 8, 18), Qt.AlignmentFlag.AlignCenter, elided1)
 
-            font2 = QFont("Microsoft YaHei UI", 8, QFont.Weight.Normal)
-            font2.setFamilies(["Microsoft YaHei UI", "PingFang SC", "Segoe UI Variable Text", "Segoe UI"])
-            font2.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
-            painter.setFont(font2)
+            painter.setFont(_ui_font(11, QFont.Weight.Normal))
             painter.setPen(_ink(self, _INK_LIGHT_SUB, QColor(148, 163, 184, 210)))
             sub_text = os.path.splitext(os.path.basename(path_str))[1].upper() if path_str else "APP"
             if not sub_text:
                 sub_text = "APP"
             painter.drawText(QRectF(4, 74, w - 8, 16), Qt.AlignmentFlag.AlignCenter, sub_text)
         else:
-            # Classic Standard mode with QPainter anti-glare drop-shadow and middle-elide
-            font = QFont("Microsoft YaHei UI", 9, QFont.Weight.Medium)
-            font.setFamilies(["Microsoft YaHei UI", "PingFang SC", "Segoe UI Variable Text", "Segoe UI"])
-            font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
-            painter.setFont(font)
-
+            painter.setFont(_ui_font(12, QFont.Weight.Medium))
             fm = painter.fontMetrics()
             elided = fm.elidedText(name, Qt.TextElideMode.ElideMiddle, int(w - 10))
-            # 只画一遍前景，去掉 0.8px 偏移阴影（避免文字重影）
-            # Forefront Text (pure crisp white)
-            painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 255)))
+            painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 248)))
             painter.drawText(QRectF(4, 70, w - 8, 22), Qt.AlignmentFlag.AlignCenter, elided)
 
         painter.end()
@@ -524,30 +657,7 @@ class MobileExpandedItemWidget(QWidget):
             return
 
         menu = QMenu(self)
-        menu.setStyleSheet("""
-        QMenu {
-            background-color: rgba(24, 26, 34, 248);
-            color: #f5f5f5;
-            border: 1px solid rgba(255, 255, 255, 45);
-            border-radius: 12px;
-            padding: 6px;
-            font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei";
-            font-size: 13px;
-        }
-        QMenu::item {
-            padding: 6px 20px;
-            border-radius: 6px;
-        }
-        QMenu::item:selected {
-            background-color: rgba(255, 255, 255, 45);
-            color: #ffffff;
-        }
-        QMenu::separator {
-            height: 1px;
-            background-color: rgba(255, 255, 255, 25);
-            margin: 4px 6px;
-        }
-        """)
+        menu.setStyleSheet(_get_menu_qss(_drawer_theme(self)))
 
         app_name = self.item_data.get("name", "应用")
         item_path = self.item_data.get("path", "")
@@ -637,6 +747,7 @@ class MobileExpandedItemWidget(QWidget):
 
     def _build_subgroup_submenu(self, menu: QMenu):
         sg_menu = menu.addMenu("子分组")
+        sg_menu.setStyleSheet(_get_menu_qss(_drawer_theme(self)))
         curr_sg = (self.item_data.get("subgroup") or "").strip()
 
         act_none = sg_menu.addAction("全部")
@@ -670,7 +781,8 @@ class MobileExpandedItemWidget(QWidget):
         self.item_changed.emit(orig, updated)
 
     def action_create_and_assign_subgroup(self):
-        new_name, ok = ModernInputDialog.getText(self, "新建子分组", "请输入子分组名称:")
+        with _drawer_modal_guard(self):
+            new_name, ok = ModernInputDialog.getText(self, "新建子分组", "请输入子分组名称:")
         if ok and new_name.strip():
             self.action_assign_subgroup(new_name.strip())
 
@@ -683,13 +795,17 @@ class MobileExpandedItemWidget(QWidget):
         if hasattr(win, "get_all_subgroups"):
             known_sgs = win.get_all_subgroups()
         dlg = AddWebBookmarkDialog(
-            self,
+            None,
             initial_url=curr_url,
             initial_name=curr_name,
             initial_subgroup=curr_sg,
-            existing_subgroups=known_sgs
+            existing_subgroups=known_sgs,
+            theme=_drawer_theme(self),
         )
-        if dlg.exec():
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        with _drawer_modal_guard(self):
+            accepted = dlg.exec()
+        if accepted:
             bm = dlg.get_bookmark_data()
             if bm:
                 orig = dict(self.item_data)
@@ -711,13 +827,14 @@ class MobileExpandedItemWidget(QWidget):
         target = resolve_shortcut_target(path)
         self.request_close.emit()
         if target and os.path.exists(target):
-            subprocess.Popen(f'explorer /select,"{target}"')
+            subprocess.Popen(["explorer.exe", f"/select,{os.path.abspath(target)}"])
         elif os.path.exists(path):
-            subprocess.Popen(f'explorer /select,"{path}"')
+            subprocess.Popen(["explorer.exe", f"/select,{os.path.abspath(path)}"])
 
     def action_rename_item(self):
         curr_name = self.item_data.get("name", "")
-        new_name, ok = ModernInputDialog.getText(self, "重命名应用", "请输入应用显示名称:", text=curr_name)
+        with _drawer_modal_guard(self):
+            new_name, ok = ModernInputDialog.getText(self, "重命名应用", "请输入应用显示名称:", text=curr_name)
         if ok and new_name.strip():
             orig = dict(self.item_data)
             updated = dict(self.item_data)
@@ -729,17 +846,19 @@ class MobileExpandedItemWidget(QWidget):
 
     def action_custom_icon(self):
         curr_name = self.item_data.get("name", "应用")
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            f"为【{curr_name}】选择自定义图标",
-            "",
-            "图标与图片文件 (*.ico *.png *.jpg *.jpeg *.bmp *.exe *.dll);;所有文件 (*.*)"
-        )
+        with _drawer_modal_guard(self):
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                f"为【{curr_name}】选择自定义图标",
+                "",
+                "图标与图片文件 (*.ico *.png *.jpg *.jpeg *.bmp *.exe *.dll);;所有文件 (*.*)"
+            )
         if file_path:
             orig = dict(self.item_data)
             updated = dict(self.item_data)
             updated["custom_icon"] = file_path
             self.item_data = updated
+            self._cached_pixmap = None
             self.update()
             self.item_changed.emit(orig, updated)
 
@@ -833,92 +952,103 @@ class SearchBannerWidget(QWidget):
         w = float(self.width())
         h = float(self.height())
         rect = QRectF(2, 2, w - 4, h - 4)
-        path = create_squircle_path(rect, 14)
+        path = create_squircle_path(rect, 12)
+        is_light = (_drawer_theme(self) == "light")
+        glow = max(0.0, min(1.0, float(self.glow_alpha)))
 
-        # 1. Background fill
+        # 1. Refined Raycast-style selection & hover surface
         if self.is_selected:
-            painter.fillPath(path, QColor(45, 120, 240, 80))
-            painter.strokePath(path, QPen(QColor(90, 170, 255, 210), 1.5))
-        elif self.glow_alpha > 0.01 or self.is_pressed:
-            alpha = int(45 * self.glow_alpha) if not self.is_pressed else 65
-            stroke_alpha = int(75 * self.glow_alpha) if not self.is_pressed else 95
-            painter.fillPath(path, QColor(255, 255, 255, alpha))
-            painter.strokePath(path, QPen(QColor(255, 255, 255, stroke_alpha), 1.0))
+            fill = QColor(37, 99, 235, 31) if is_light else QColor(59, 130, 246, 56)
+            stroke = QColor(59, 130, 246, 95) if is_light else QColor(96, 165, 250, 115)
+            painter.fillPath(path, fill)
+            painter.strokePath(path, QPen(stroke, 1.0))
+        elif glow > 0.01 or self.is_pressed:
+            if is_light:
+                alpha = int(14 * glow) if not self.is_pressed else 22
+                stroke_alpha = int(22 * glow) if not self.is_pressed else 34
+                painter.fillPath(path, QColor(15, 23, 42, alpha))
+                painter.strokePath(path, QPen(QColor(15, 23, 42, stroke_alpha), 1.0))
+            else:
+                alpha = int(24 * glow) if not self.is_pressed else 36
+                stroke_alpha = int(36 * glow) if not self.is_pressed else 54
+                painter.fillPath(path, QColor(255, 255, 255, alpha))
+                painter.strokePath(path, QPen(QColor(255, 255, 255, stroke_alpha), 1.0))
         else:
-            painter.fillPath(path, QColor(255, 255, 255, 16))
-            painter.strokePath(path, QPen(QColor(255, 255, 255, 30), 1.0))
+            if is_light:
+                painter.fillPath(path, QColor(15, 23, 42, 8))
+                painter.strokePath(path, QPen(QColor(15, 23, 42, 16), 0.8))
+            else:
+                painter.fillPath(path, QColor(255, 255, 255, 10))
+                painter.strokePath(path, QPen(QColor(255, 255, 255, 20), 0.8))
 
         # 2. Icon / Badge on the left
         icon_str = self.item_data.get("icon", "")
         if not icon_str:
-            # Sleek monochromatic vector magnifying glass badge
-            pen = QPen(QColor(100, 180, 255), 1.6)
+            pen = QPen(QColor(37, 99, 235, 210) if is_light else QColor(96, 165, 250, 225), 1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            glass_r = 4.8
-            glass_cx = 26.0
+            glass_r = 4.6
+            glass_cx = 25.5
             glass_cy = h / 2.0 - 1.2
             painter.drawEllipse(QRectF(glass_cx - glass_r, glass_cy - glass_r, glass_r * 2, glass_r * 2))
-            p_start = QPoint(int(glass_cx + glass_r * 0.707), int(glass_cy + glass_r * 0.707))
-            p_end = QPoint(int(p_start.x() + 4.8), int(p_start.y() + 4.8))
+            p_start = QPointF(glass_cx + glass_r * 0.707, glass_cy + glass_r * 0.707)
+            p_end = QPointF(p_start.x() + 4.4, p_start.y() + 4.4)
             painter.drawLine(p_start, p_end)
         else:
-            font_icon = QFont("Segoe UI", 12, QFont.Weight.DemiBold)
-            font_icon.setFamilies(["Segoe UI", "Microsoft YaHei UI", "PingFang SC"])
-            painter.setFont(font_icon)
-            painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255)))
-            painter.drawText(QRectF(14, 0, 28, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, icon_str)
+            painter.setFont(_ui_font(14, QFont.Weight.DemiBold))
+            painter.setPen(_ink(self, _INK_LIGHT, QColor(248, 250, 252)))
+            painter.drawText(QRectF(14, 0, 28, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter, icon_str)
 
-        # 3. Enter key badge on far right
-        badge_w = 64
-        badge_h = 24
-        badge_x = w - badge_w - 14
+        # 3. Crisp keycap pill on far right
+        badge_w = 56
+        badge_h = 22
+        badge_x = w - badge_w - 12
         badge_y = (h - badge_h) / 2.0
         badge_rect = QRectF(badge_x, badge_y, badge_w, badge_h)
         badge_path = create_squircle_path(badge_rect, 6)
 
-        badge_bg = QColor(255, 255, 255, 45) if self.is_selected else QColor(255, 255, 255, 20)
+        if is_light:
+            badge_bg = QColor(37, 99, 235, 24) if self.is_selected else QColor(15, 23, 42, 14)
+            badge_border = QColor(59, 130, 246, 65) if self.is_selected else QColor(15, 23, 42, 24)
+            badge_fg = QColor(30, 64, 175, 235) if self.is_selected else QColor(71, 85, 105, 220)
+        else:
+            badge_bg = QColor(255, 255, 255, 34) if self.is_selected else QColor(255, 255, 255, 26)
+            badge_border = QColor(255, 255, 255, 50) if self.is_selected else QColor(255, 255, 255, 34)
+            badge_fg = QColor(255, 255, 255, 235) if self.is_selected else QColor(203, 213, 225, 210)
         painter.fillPath(badge_path, badge_bg)
-        painter.strokePath(badge_path, QPen(QColor(255, 255, 255, 40), 0.8))
+        painter.strokePath(badge_path, QPen(badge_border, 0.8))
 
-        font_badge = QFont("Segoe UI Variable Display", 9, QFont.Weight.Medium)
-        painter.setFont(font_badge)
-        painter.setPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 220)))
-        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "Enter")
+        painter.setFont(_ui_font(11, QFont.Weight.Medium))
+        painter.setPen(badge_fg)
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, "↵ Enter")
 
         # 4. Main title text
         title_text = self.item_data.get("name", "")
-        # Avoid double-drawing the icon badge if title_text starts with it
         if icon_str and title_text.startswith(icon_str):
             title_text = title_text[len(icon_str):].lstrip()
 
-        font_title = QFont("Segoe UI Variable Display", 11, QFont.Weight.Medium)
-        font_title.setFamilies(["Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI"])
-        painter.setFont(font_title)
+        painter.setFont(_ui_font(14, QFont.Weight.Medium))
         painter.setPen(_ink(self, _INK_LIGHT,
-                            QColor(255, 255, 255, 240) if not self.is_selected
+                            QColor(241, 245, 249, 240) if not self.is_selected
                             else QColor(255, 255, 255, 255)))
 
         fm = painter.fontMetrics()
-        avail_w = int(badge_x - 52 - 10)
+        avail_w = max(20, int(badge_x - 48 - 10))
         elided = fm.elidedText(title_text, Qt.TextElideMode.ElideRight, avail_w)
-        painter.drawText(QRectF(50, 0, avail_w, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
+        painter.drawText(QRectF(48, 0, avail_w, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
 
         painter.end()
 
 
 class SearchFileBannerWidget(QWidget):
     """
-    Raycast / Spotlight 风格全盘文件极速检索结果行:
-    - 52px 紧凑标准高度，无极超椭圆背景
+    Raycast / Spotlight 风格全盘文件检索结果行:
+    - 52px 紧凑标准高度，连续曲率圆角背景
     - Windows Shell 高清原生文件/目录图标 (32x32)
-    - 第一行：文件/文件夹主名称 (11pt Segoe UI Variable Display)
-    - 第二行：文件所在物理路径 (9pt 浅灰缩略)
-    - 右侧：文件后缀类别药丸标签 (.PDF, .PY, .DOCX, 文件夹)
-    - 回车 (Enter): 直接打开文件/运行程序
-    - Ctrl + 回车 (Ctrl+Enter): 在资源管理器中高亮定位选中 (explorer /select)
-    - 完整右键菜单: 打开、管理员运行、定位目录、复制路径、属性
+    - 第一行：文件/文件夹主名称
+    - 第二行：文件所在物理路径
+    - 右侧：文件后缀类别药丸标签
     """
     clicked = Signal(dict)
     open_folder_requested = Signal(dict)
@@ -946,9 +1076,12 @@ class SearchFileBannerWidget(QWidget):
         return QSize(200, 52)
 
     def update_tooltip(self):
-        name = self.item_data.get("name", "")
-        path = self.item_data.get("path", "")
-        self.setToolTip(f"<div style='font-family: Segoe UI, PingFang SC, Microsoft YaHei;'><b>{name}</b><br><span style='color:#bbb; font-size:11px;'>{path}</span><br><span style='color:#60a5fa; font-size:10px;'>回车打开 · Ctrl+回车 在资源管理器中定位</span></div>")
+        name = (self.item_data.get("name") or "").strip()
+        path = (self.item_data.get("path") or "").strip()
+        if name and path and path != name:
+            self.setToolTip(f"{name}\n{path}")
+        else:
+            self.setToolTip(name or path)
 
     def _on_glow_anim_tick(self, val):
         self.glow_alpha = float(val)
@@ -1002,20 +1135,34 @@ class SearchFileBannerWidget(QWidget):
         w = float(self.width())
         h = float(self.height())
         rect = QRectF(2, 2, w - 4, h - 4)
-        path = create_squircle_path(rect, 14)
+        path = create_squircle_path(rect, 12)
+        is_light = (_drawer_theme(self) == "light")
+        glow = max(0.0, min(1.0, float(self.glow_alpha)))
 
-        # 1. Background fill
+        # 1. Refined Raycast-style selection & hover surface
         if self.is_selected:
-            painter.fillPath(path, QColor(45, 120, 240, 85))
-            painter.strokePath(path, QPen(QColor(90, 170, 255, 210), 1.2))
-        elif self.glow_alpha > 0.01 or self.is_pressed:
-            alpha = int(45 * self.glow_alpha) if not self.is_pressed else 65
-            stroke_alpha = int(75 * self.glow_alpha) if not self.is_pressed else 95
-            painter.fillPath(path, QColor(255, 255, 255, alpha))
-            painter.strokePath(path, QPen(QColor(255, 255, 255, stroke_alpha), 1.0))
+            fill = QColor(37, 99, 235, 31) if is_light else QColor(59, 130, 246, 56)
+            stroke = QColor(59, 130, 246, 95) if is_light else QColor(96, 165, 250, 115)
+            painter.fillPath(path, fill)
+            painter.strokePath(path, QPen(stroke, 1.0))
+        elif glow > 0.01 or self.is_pressed:
+            if is_light:
+                alpha = int(14 * glow) if not self.is_pressed else 22
+                stroke_alpha = int(22 * glow) if not self.is_pressed else 34
+                painter.fillPath(path, QColor(15, 23, 42, alpha))
+                painter.strokePath(path, QPen(QColor(15, 23, 42, stroke_alpha), 1.0))
+            else:
+                alpha = int(24 * glow) if not self.is_pressed else 36
+                stroke_alpha = int(36 * glow) if not self.is_pressed else 54
+                painter.fillPath(path, QColor(255, 255, 255, alpha))
+                painter.strokePath(path, QPen(QColor(255, 255, 255, stroke_alpha), 1.0))
         else:
-            painter.fillPath(path, QColor(255, 255, 255, 14))
-            painter.strokePath(path, QPen(QColor(255, 255, 255, 24), 0.8))
+            if is_light:
+                painter.fillPath(path, QColor(15, 23, 42, 7))
+                painter.strokePath(path, QPen(QColor(15, 23, 42, 15), 0.8))
+            else:
+                painter.fillPath(path, QColor(255, 255, 255, 9))
+                painter.strokePath(path, QPen(QColor(255, 255, 255, 18), 0.8))
 
         # 2. File / Folder native icon
         file_path = self.item_data.get("path", "")
@@ -1035,44 +1182,72 @@ class SearchFileBannerWidget(QWidget):
                 painter.setBrush(QColor(148, 163, 184, 220))
                 painter.drawRoundedRect(QRectF(16, 12, 24, 28), 4, 4)
 
-        # 3. Extension Badge / Tag on the right
+        # 3. Extension Badge & optional Enter keycap on the right
         ext_text = "文件夹" if is_folder else (os.path.splitext(file_name)[1].upper() or "文件")
         if len(ext_text) > 7:
             ext_text = ext_text[:7]
 
-        font_badge = QFont("Segoe UI Variable Display", 9, QFont.Weight.Medium)
+        font_badge = _ui_font(11, QFont.Weight.Medium)
         fm_badge = QFontMetrics(font_badge)
-        bw = max(46, fm_badge.horizontalAdvance(ext_text) + 14)
-        bh = 22
-        bx = max(54.0, w - bw - 14)
+        right_cursor = w - 12.0
+
+        if self.is_selected:
+            kw, kh = 26.0, 22.0
+            kx = right_cursor - kw
+            ky = (h - kh) / 2.0
+            k_rect = QRectF(kx, ky, kw, kh)
+            k_path = create_squircle_path(k_rect, 6)
+            if is_light:
+                painter.fillPath(k_path, QColor(37, 99, 235, 24))
+                painter.strokePath(k_path, QPen(QColor(59, 130, 246, 65), 0.8))
+                painter.setPen(QColor(30, 64, 175, 235))
+            else:
+                painter.fillPath(k_path, QColor(255, 255, 255, 26))
+                painter.strokePath(k_path, QPen(QColor(255, 255, 255, 42), 0.8))
+                painter.setPen(QColor(248, 250, 252, 235))
+            painter.setFont(font_badge)
+            painter.drawText(k_rect, Qt.AlignmentFlag.AlignCenter, "↵")
+            right_cursor = kx - 6.0
+
+        bw = max(44.0, float(fm_badge.horizontalAdvance(ext_text) + 14))
+        bh = 22.0
+        bx = max(54.0, right_cursor - bw)
         by = (h - bh) / 2.0
         badge_rect = QRectF(bx, by, bw, bh)
         b_path = create_squircle_path(badge_rect, 6)
 
         if is_folder:
-            bg_badge = QColor(234, 179, 8, 45) if self.is_selected else QColor(234, 179, 8, 28)
-            border_badge = QColor(234, 179, 8, 120)
-            text_badge = QColor(253, 224, 71, 230)
+            if is_light:
+                bg_badge = QColor(217, 119, 6, 26)
+                border_badge = QColor(217, 119, 6, 70)
+                text_badge = QColor(180, 83, 9, 240)
+            else:
+                bg_badge = QColor(234, 179, 8, 36) if self.is_selected else QColor(234, 179, 8, 24)
+                border_badge = QColor(234, 179, 8, 95)
+                text_badge = QColor(253, 224, 71, 230)
         else:
-            bg_badge = QColor(59, 130, 246, 45) if self.is_selected else QColor(255, 255, 255, 22)
-            border_badge = QColor(96, 165, 250, 110) if self.is_selected else QColor(255, 255, 255, 35)
-            text_badge = QColor(147, 197, 253, 230) if self.is_selected else QColor(226, 232, 240, 210)
+            if is_light:
+                bg_badge = QColor(37, 99, 235, 22) if self.is_selected else QColor(15, 23, 42, 12)
+                border_badge = QColor(59, 130, 246, 60) if self.is_selected else QColor(15, 23, 42, 22)
+                text_badge = QColor(30, 64, 175, 235) if self.is_selected else QColor(71, 85, 105, 225)
+            else:
+                bg_badge = QColor(59, 130, 246, 38) if self.is_selected else QColor(255, 255, 255, 26)
+                border_badge = QColor(96, 165, 250, 95) if self.is_selected else QColor(255, 255, 255, 32)
+                text_badge = QColor(191, 219, 254, 235) if self.is_selected else QColor(203, 213, 225, 210)
 
         painter.fillPath(b_path, bg_badge)
         painter.strokePath(b_path, QPen(border_badge, 0.8))
         painter.setFont(font_badge)
-        painter.setPen(_ink(self, _INK_LIGHT_BLUE, text_badge))
+        painter.setPen(text_badge)
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, ext_text)
 
         # 4. Text (Two rows: name and directory)
         avail_w = max(20, int(bx - 52 - 8))
 
         # Row 1: File/Folder Name
-        font_name = QFont("Segoe UI Variable Display", 11, QFont.Weight.Medium)
-        font_name.setFamilies(["Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI"])
-        painter.setFont(font_name)
+        painter.setFont(_ui_font(14, QFont.Weight.Medium))
         painter.setPen(_ink(self, _INK_LIGHT,
-                            QColor(255, 255, 255, 245) if not self.is_selected
+                            QColor(241, 245, 249, 245) if not self.is_selected
                             else QColor(255, 255, 255, 255)))
         fm_name = painter.fontMetrics()
         elided_name = fm_name.elidedText(file_name, Qt.TextElideMode.ElideRight, avail_w)
@@ -1082,12 +1257,10 @@ class SearchFileBannerWidget(QWidget):
         dir_path = self.item_data.get("dir", "")
         if not dir_path and file_path:
             dir_path = os.path.dirname(file_path)
-        font_path = QFont("Segoe UI Variable Display", 9, QFont.Weight.Normal)
-        font_path.setFamilies(["Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI"])
-        painter.setFont(font_path)
+        painter.setFont(_ui_font(12, QFont.Weight.Normal))
         painter.setPen(_ink(self, _INK_LIGHT_SUB,
-                            QColor(148, 163, 184, 210) if not self.is_selected
-                            else QColor(191, 219, 254, 230)))
+                            QColor(148, 163, 184, 205) if not self.is_selected
+                            else QColor(191, 219, 254, 225)))
         fm_path = painter.fontMetrics()
         elided_path = fm_path.elidedText(dir_path, Qt.TextElideMode.ElideMiddle, avail_w)
         painter.drawText(QRectF(52, 27, avail_w, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_path)
@@ -1100,30 +1273,7 @@ class SearchFileBannerWidget(QWidget):
             return
 
         menu = QMenu(self)
-        menu.setStyleSheet("""
-        QMenu {
-            background-color: rgba(24, 26, 34, 248);
-            color: #f5f5f5;
-            border: 1px solid rgba(255, 255, 255, 45);
-            border-radius: 12px;
-            padding: 6px;
-            font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei";
-            font-size: 13px;
-        }
-        QMenu::item {
-            padding: 6px 20px;
-            border-radius: 6px;
-        }
-        QMenu::item:selected {
-            background-color: rgba(255, 255, 255, 45);
-            color: #ffffff;
-        }
-        QMenu::separator {
-            height: 1px;
-            background-color: rgba(255, 255, 255, 25);
-            margin: 4px 6px;
-        }
-        """)
+        menu.setStyleSheet(_get_menu_qss(_drawer_theme(self)))
 
         fn = self.item_data.get("name", "文件")
         is_folder = self.item_data.get("is_folder", False)
@@ -1173,7 +1323,8 @@ class MorphSheetWidget(QWidget):
         self.theme = theme
         self.radius = radius
         self.opacity = 0.98
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if parent is None:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1188,63 +1339,65 @@ class MorphSheetWidget(QWidget):
         pad = 2.0
         rect = QRectF(pad, pad, w - pad * 2, h - pad * 2)
         path = create_squircle_path(rect, self.radius)
+        inner_rect = rect.adjusted(1.0, 1.0, -1.0, -1.0)
+        inner_path = create_squircle_path(inner_rect, max(1.0, self.radius - 1.0))
 
         op = max(0.05, min(1.0, float(self.opacity)))
 
-        # 1. Multi-layer ambient radial bloom
-        ambient_radial = QRadialGradient(w * 0.3, h * 0.22, max(w, h) * 0.85)
+        # 1. Refined frosted glass sheet fill (dark / oled / light)
+        grad = QLinearGradient(0, rect.top(), 0, rect.bottom())
         if self.theme == "light":
-            ambient_radial.setColorAt(0.0, QColor(255, 255, 255, int(100 * op)))
-            ambient_radial.setColorAt(0.6, QColor(240, 248, 255, int(30 * op)))
-            ambient_radial.setColorAt(1.0, QColor(230, 240, 255, 0))
+            grad.setColorAt(0.0, QColor(250, 251, 254, int(246 * op)))
+            grad.setColorAt(0.45, QColor(246, 248, 252, int(244 * op)))
+            grad.setColorAt(1.0, QColor(241, 245, 251, int(244 * op)))
+            painter.fillPath(path, grad)
+
+            ambient = QRadialGradient(w * 0.5, 0.0, max(w, h) * 0.72)
+            ambient.setColorAt(0.0, QColor(255, 255, 255, int(90 * op)))
+            ambient.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillPath(path, ambient)
+
+            # Dual specular rim: crisp outer hairline + soft inner white highlight
+            painter.strokePath(path, QPen(QColor(15, 23, 42, int(22 * op)), 1.0))
+            inner_rim = QLinearGradient(0, inner_rect.top(), 0, inner_rect.bottom())
+            inner_rim.setColorAt(0.0, QColor(255, 255, 255, int(210 * op)))
+            inner_rim.setColorAt(1.0, QColor(255, 255, 255, int(75 * op)))
+            painter.strokePath(inner_path, QPen(inner_rim, 1.0))
         elif self.theme == "oled":
-            ambient_radial.setColorAt(0.0, QColor(42, 46, 62, int(50 * op)))
-            ambient_radial.setColorAt(0.6, QColor(18, 20, 28, int(20 * op)))
-            ambient_radial.setColorAt(1.0, QColor(0, 0, 0, 0))
-        else:
-            ambient_radial.setColorAt(0.0, QColor(74, 80, 94, int(50 * op)))
-            ambient_radial.setColorAt(0.6, QColor(32, 35, 42, int(20 * op)))
-            ambient_radial.setColorAt(1.0, QColor(14, 15, 20, 0))
-        painter.fillPath(path, ambient_radial)
+            grad.setColorAt(0.0, QColor(15, 16, 21, int(248 * op)))
+            grad.setColorAt(0.5, QColor(10, 11, 15, int(250 * op)))
+            grad.setColorAt(1.0, QColor(7, 8, 11, int(252 * op)))
+            painter.fillPath(path, grad)
 
-        # 2. Main multi-stop liquid glass gradient
-        grad = QLinearGradient(0, 0, w * 0.35, h)
-        if self.theme == "light":
-            grad.setColorAt(0.0, QColor(255, 255, 255, int(220 * op)))
-            grad.setColorAt(0.4, QColor(245, 248, 255, int(200 * op)))
-            grad.setColorAt(1.0, QColor(232, 238, 252, int(210 * op)))
-        elif self.theme == "oled":
-            grad.setColorAt(0.0, QColor(28, 30, 38, int(248 * op)))
-            grad.setColorAt(0.5, QColor(14, 16, 22, int(252 * op)))
-            grad.setColorAt(1.0, QColor(8, 9, 13, int(255 * op)))
-        else:
-            # 与桌面卡片的液态玻璃同色系（中性灰蓝），不再用高不透明的深海军蓝，
-            # 避免从卡片展开到抽屉时出现明显的色差跳变
-            grad.setColorAt(0.0, QColor(38, 41, 49, int(216 * op)))
-            grad.setColorAt(0.4, QColor(26, 28, 34, int(222 * op)))
-            grad.setColorAt(1.0, QColor(18, 19, 24, int(228 * op)))
-        painter.fillPath(path, grad)
+            ambient = QRadialGradient(w * 0.5, 0.0, max(w, h) * 0.65)
+            ambient.setColorAt(0.0, QColor(255, 255, 255, int(12 * op)))
+            ambient.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillPath(path, ambient)
 
-        # 3. Specular Rim Light 1.0px (迎光面细线半透明微光边框)
-        rim = QLinearGradient(0, 0, w, h)
-        if self.theme == "light":
-            rim.setColorAt(0.0, QColor(255, 255, 255, int(240 * op)))
-            rim.setColorAt(0.4, QColor(255, 255, 255, int(150 * op)))
-            rim.setColorAt(1.0, QColor(255, 255, 255, int(80 * op)))
+            painter.strokePath(path, QPen(QColor(255, 255, 255, int(28 * op)), 1.0))
+            inner_rim = QLinearGradient(0, inner_rect.top(), 0, inner_rect.bottom())
+            inner_rim.setColorAt(0.0, QColor(255, 255, 255, int(28 * op)))
+            inner_rim.setColorAt(0.45, QColor(255, 255, 255, 0))
+            inner_rim.setColorAt(1.0, QColor(0, 0, 0, int(45 * op)))
+            painter.strokePath(inner_path, QPen(inner_rim, 1.0))
         else:
-            rim.setColorAt(0.0, QColor(255, 255, 255, int(150 * op)))
-            rim.setColorAt(0.4, QColor(255, 255, 255, int(60 * op)))
-            rim.setColorAt(1.0, QColor(255, 255, 255, int(18 * op)))
-        painter.strokePath(path, QPen(rim, 1.0))
+            grad.setColorAt(0.0, QColor(22, 24, 31, int(238 * op)))
+            grad.setColorAt(0.45, QColor(18, 20, 26, int(240 * op)))
+            grad.setColorAt(1.0, QColor(15, 17, 22, int(242 * op)))
+            painter.fillPath(path, grad)
 
-        # 4. Top Specular Micro-Bevel Sheen
-        sheen_w = max(1.0, w - 1.6 * self.radius)
-        sheen_rect = QRectF(self.radius * 0.8, 1.2, sheen_w, 1.5)
-        sheen_grad = QLinearGradient(sheen_rect.left(), 0, sheen_rect.right(), 0)
-        sheen_grad.setColorAt(0.0, QColor(255, 255, 255, 0))
-        sheen_grad.setColorAt(0.5, QColor(255, 255, 255, int(95 * op)))
-        sheen_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
-        painter.fillRect(sheen_rect, sheen_grad)
+            ambient = QRadialGradient(w * 0.5, 0.0, max(w, h) * 0.68)
+            ambient.setColorAt(0.0, QColor(255, 255, 255, int(14 * op)))
+            ambient.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.fillPath(path, ambient)
+
+            # Dual specular rim: 1px rgba(255,255,255,34) outer rim + subtle inner top sheen
+            painter.strokePath(path, QPen(QColor(255, 255, 255, int(34 * op)), 1.0))
+            inner_rim = QLinearGradient(0, inner_rect.top(), 0, inner_rect.bottom())
+            inner_rim.setColorAt(0.0, QColor(255, 255, 255, int(30 * op)))
+            inner_rim.setColorAt(0.45, QColor(255, 255, 255, 0))
+            inner_rim.setColorAt(1.0, QColor(0, 0, 0, int(42 * op)))
+            painter.strokePath(inner_path, QPen(inner_rim, 1.0))
 
         painter.end()
 
@@ -1290,6 +1443,7 @@ class VectorIconButton(QPushButton):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.is_hovered = False
         self.is_pressed = False
+        self.is_active = False
         self.hover_alpha = 0.0
 
         self.hover_anim = QVariantAnimation(self)
@@ -1342,75 +1496,97 @@ class VectorIconButton(QPushButton):
         pad = 1.0
         rect = QRectF(pad, pad, w - pad * 2, h - pad * 2)
         capsule_path = create_squircle_path(rect, (w - pad * 2) / 2.0)
+        is_light = (_drawer_theme(self) == "light")
+        hover_t = max(0.0, min(1.0, float(self.hover_alpha)))
 
-        # 1. Background capsule highlight
-        if self.icon_type == "close" and (self.is_hovered or self.is_pressed):
-            red_alpha = int(180 + 35 * self.hover_alpha) if self.is_pressed else int(140 * self.hover_alpha)
-            painter.fillPath(capsule_path, QColor(235, 75, 75, red_alpha))
-            painter.strokePath(capsule_path, QPen(QColor(255, 110, 110, int(180 * self.hover_alpha)), 1.0))
+        # 1. Restrained frosted capsule highlight
+        close_hot = (self.icon_type == "close" and (self.is_hovered or self.is_pressed))
+        active_on = bool(getattr(self, "is_active", False))
+        if close_hot:
+            red_alpha = int(195 + 30 * hover_t) if self.is_pressed else int(155 * max(0.35, hover_t))
+            painter.fillPath(capsule_path, QColor(239, 68, 68, red_alpha))
+            painter.strokePath(capsule_path, QPen(QColor(248, 113, 113, int(140 * max(0.35, hover_t))), 0.9))
+        elif active_on:
+            fill = QColor(37, 99, 235, int(34 + 18 * hover_t)) if is_light else QColor(59, 130, 246, int(60 + 24 * hover_t))
+            stroke = QColor(37, 99, 235, 85) if is_light else QColor(96, 165, 250, 115)
+            painter.fillPath(capsule_path, fill)
+            painter.strokePath(capsule_path, QPen(stroke, 0.9))
+        elif is_light:
+            base_alpha = int(10 + 16 * hover_t) if not self.is_pressed else 30
+            border_alpha = int(10 + 16 * hover_t) if not self.is_pressed else 32
+            painter.fillPath(capsule_path, QColor(15, 23, 42, base_alpha))
+            if border_alpha > 12:
+                painter.strokePath(capsule_path, QPen(QColor(15, 23, 42, border_alpha), 0.8))
         else:
-            base_alpha = int(22 + 35 * self.hover_alpha) if not self.is_pressed else 65
-            border_alpha = int(35 + 40 * self.hover_alpha) if not self.is_pressed else 85
+            base_alpha = int(12 + 24 * hover_t) if not self.is_pressed else 48
+            border_alpha = int(14 + 26 * hover_t) if not self.is_pressed else 58
             painter.fillPath(capsule_path, QColor(255, 255, 255, base_alpha))
-            painter.strokePath(capsule_path, QPen(QColor(255, 255, 255, border_alpha), 0.8))
+            if border_alpha > 16:
+                painter.strokePath(capsule_path, QPen(QColor(255, 255, 255, border_alpha), 0.8))
 
-        # 2. Vector Glyph
+        # 2. Subpixel Vector Glyph
         cx, cy = w / 2.0, h / 2.0
+        if close_hot:
+            glyph_fg = QColor(255, 255, 255, 248)
+        elif active_on:
+            glyph_fg = QColor(29, 78, 216, 245) if is_light else QColor(147, 197, 253, 250)
+        else:
+            glyph_fg = _ink(self, QColor(51, 65, 85, 235), QColor(226, 232, 240, 235))
         if self.icon_type == "close":
-            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 245)), 1.6)
+            pen = QPen(glyph_fg, 1.55)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             r = 4.2
-            painter.drawLine(QPoint(int(cx - r), int(cy - r)), QPoint(int(cx + r), int(cy + r)))
-            painter.drawLine(QPoint(int(cx - r), int(cy + r)), QPoint(int(cx + r), int(cy - r)))
+            painter.drawLine(QPointF(cx - r, cy - r), QPointF(cx + r, cy + r))
+            painter.drawLine(QPointF(cx - r, cy + r), QPointF(cx + r, cy - r))
 
         elif self.icon_type == "search":
-            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)), 1.6)
+            pen = QPen(glyph_fg, 1.55)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
-            glass_r = 4.6
-            glass_cx = cx - 1.5
-            glass_cy = cy - 1.5
+            glass_r = 4.4
+            glass_cx = cx - 1.4
+            glass_cy = cy - 1.4
             painter.drawEllipse(QRectF(glass_cx - glass_r, glass_cy - glass_r, glass_r * 2, glass_r * 2))
 
-            stem_len = 4.6
-            p_start = QPoint(int(glass_cx + glass_r * 0.707), int(glass_cy + glass_r * 0.707))
-            p_end = QPoint(int(p_start.x() + stem_len), int(p_start.y() + stem_len))
+            stem_len = 4.2
+            p_start = QPointF(glass_cx + glass_r * 0.707, glass_cy + glass_r * 0.707)
+            p_end = QPointF(p_start.x() + stem_len, p_start.y() + stem_len)
             painter.drawLine(p_start, p_end)
 
         elif self.icon_type == "tidy":
-            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)), 1.6)
+            pen = QPen(glyph_fg, 1.55)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
-            box_r = QRectF(cx - 6, cy - 5, 12, 10)
+            box_r = QRectF(cx - 5.8, cy - 4.8, 11.6, 9.6)
             painter.drawRoundedRect(box_r, 2.5, 2.5)
-            painter.drawLine(QPoint(int(cx - 3), int(cy)), QPoint(int(cx + 3), int(cy)))
+            painter.drawLine(QPointF(cx - 3.0, cy), QPointF(cx + 3.0, cy))
 
         elif self.icon_type == "settings":
-            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)), 1.5)
+            pen = QPen(glyph_fg, 1.45)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
-            y1, y2, y3 = cy - 4.5, cy, cy + 4.5
-            painter.drawLine(QPoint(int(cx - 6), int(y1)), QPoint(int(cx + 6), int(y1)))
-            painter.drawLine(QPoint(int(cx - 6), int(y2)), QPoint(int(cx + 6), int(y2)))
-            painter.drawLine(QPoint(int(cx - 6), int(y3)), QPoint(int(cx + 6), int(y3)))
-            painter.setBrush(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 240)))
-            painter.drawEllipse(QRectF(cx - 4, y1 - 1.8, 3.6, 3.6))
-            painter.drawEllipse(QRectF(cx + 1, y2 - 1.8, 3.6, 3.6))
-            painter.drawEllipse(QRectF(cx - 2, y3 - 1.8, 3.6, 3.6))
+            y1, y2, y3 = cy - 4.4, cy, cy + 4.4
+            painter.drawLine(QPointF(cx - 5.8, y1), QPointF(cx + 5.8, y1))
+            painter.drawLine(QPointF(cx - 5.8, y2), QPointF(cx + 5.8, y2))
+            painter.drawLine(QPointF(cx - 5.8, y3), QPointF(cx + 5.8, y3))
+            painter.setBrush(glyph_fg)
+            painter.drawEllipse(QRectF(cx - 3.8, y1 - 1.7, 3.4, 3.4))
+            painter.drawEllipse(QRectF(cx + 0.8, y2 - 1.7, 3.4, 3.4))
+            painter.drawEllipse(QRectF(cx - 2.0, y3 - 1.7, 3.4, 3.4))
 
         elif self.icon_type == "add":
-            pen = QPen(_ink(self, _INK_LIGHT, QColor(255, 255, 255, 230)), 1.6)
+            pen = QPen(glyph_fg, 1.5)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
-            painter.drawLine(QPoint(int(cx - 5), int(cy)), QPoint(int(cx + 5), int(cy)))
-            painter.drawLine(QPoint(int(cx), int(cy - 5)), QPoint(int(cx), int(cy + 5)))
+            painter.drawLine(QPointF(cx - 4.5, cy), QPointF(cx + 4.5, cy))
+            painter.drawLine(QPointF(cx, cy - 4.5), QPointF(cx, cy + 4.5))
 
         painter.end()
 
@@ -1418,9 +1594,8 @@ class VectorIconButton(QPushButton):
 class SubgroupPillButton(QPushButton):
     """
     Subgroup tab pill button:
-    - Renders smooth system-style squircle rounded capsule (height 28px)
-    - Active vs inactive states with custom modern styling
-    - Title + count e.g. '全部 (12)' or '网页书签 (4)'
+    - Renders smooth segmented squircle capsule (height 28px)
+    - Active vs inactive states with subtle frosted pill fill
     - Context menu on right click for custom tabs (Rename / Delete)
     """
     rename_requested = Signal(str)
@@ -1439,70 +1614,89 @@ class SubgroupPillButton(QPushButton):
         self.is_active = active
         self._update_appearance()
 
-
     def _update_appearance(self):
         text = f"{self.subgroup_name} ({self.count})" if self.count >= 0 else self.subgroup_name
         self.setText(text)
-        if self.is_active:
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: rgba(255, 255, 255, 0.22);
-                    color: #ffffff;
-                    border: 1px solid rgba(255, 255, 255, 0.40);
-                    border-radius: 14px;
-                    padding: 3px 12px;
-                    font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
-                    font-size: 12px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: rgba(255, 255, 255, 0.28);
-                    border: 1px solid rgba(255, 255, 255, 0.55);
-                }
-            """)
+        self.setFont(_ui_font(12, QFont.Weight.DemiBold if self.is_active else QFont.Weight.Medium))
+        is_light = (_drawer_theme(self) == "light")
+        if is_light:
+            if self.is_active:
+                self.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(59, 130, 246, 0.14);
+                        color: #1d4ed8;
+                        border: 1px solid rgba(59, 130, 246, 0.28);
+                        border-radius: 13px;
+                        padding: 3px 12px;
+                        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(59, 130, 246, 0.20);
+                        border: 1px solid rgba(59, 130, 246, 0.38);
+                    }
+                """)
+            else:
+                self.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(15, 23, 42, 0.045);
+                        color: #475569;
+                        border: 1px solid transparent;
+                        border-radius: 13px;
+                        padding: 3px 12px;
+                        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(15, 23, 42, 0.085);
+                        color: #0f172a;
+                        border: 1px solid rgba(15, 23, 42, 0.08);
+                    }
+                """)
         else:
-            self.setStyleSheet("""
-                QPushButton {
-                    background-color: rgba(255, 255, 255, 0.07);
-                    color: rgba(240, 240, 240, 0.75);
-                    border: 1px solid rgba(255, 255, 255, 0.10);
-                    border-radius: 14px;
-                    padding: 3px 12px;
-                    font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
-                    font-size: 12px;
-                    font-weight: normal;
-                }
-                QPushButton:hover {
-                    background-color: rgba(255, 255, 255, 0.14);
-                    color: #ffffff;
-                    border: 1px solid rgba(255, 255, 255, 0.22);
-                }
-            """)
-        if _drawer_theme(self) == "light":
-            self.setStyleSheet(recolor_qss(self.styleSheet(), "#0f172a"))
+            if self.is_active:
+                self.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(59, 130, 246, 0.24);
+                        color: #f8fafc;
+                        border: 1px solid rgba(96, 165, 250, 0.42);
+                        border-radius: 13px;
+                        padding: 3px 12px;
+                        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(59, 130, 246, 0.32);
+                        border: 1px solid rgba(96, 165, 250, 0.55);
+                    }
+                """)
+            else:
+                self.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(255, 255, 255, 0.05);
+                        color: rgba(203, 213, 225, 0.82);
+                        border: 1px solid transparent;
+                        border-radius: 13px;
+                        padding: 3px 12px;
+                        font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(255, 255, 255, 0.10);
+                        color: #f8fafc;
+                        border: 1px solid rgba(255, 255, 255, 0.10);
+                    }
+                """)
 
     def contextMenuEvent(self, event):
         if self.subgroup_name in ("全部", "All"):
             return
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: rgba(24, 26, 34, 248);
-                color: #f5f5f5;
-                border: 1px solid rgba(255, 255, 255, 45);
-                border-radius: 10px;
-                padding: 4px;
-                font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
-                font-size: 12px;
-            }
-            QMenu::item {
-                padding: 5px 16px;
-                border-radius: 6px;
-            }
-            QMenu::item:selected {
-                background-color: rgba(255, 255, 255, 45);
-            }
-        """)
+        menu.setStyleSheet(_get_menu_qss(_drawer_theme(self)))
         act_rename = menu.addAction(f"重命名【{self.subgroup_name}】...")
         act_rename.triggered.connect(lambda: self.rename_requested.emit(self.subgroup_name))
         act_del = menu.addAction(f"删除子分组【{self.subgroup_name}】")
@@ -1546,7 +1740,7 @@ class FolderSubgroupTabBar(QWidget):
 
         # '+' button to add a new subgroup
         self.btn_add = VectorIconButton("add", size=26, parent=self)
-        self.btn_add.setToolTip("新建二级子分组 (Tab)...")
+        self.btn_add.setToolTip("新建子分组")
         self.btn_add.clicked.connect(self.request_add_subgroup.emit)
         self.main_layout.addWidget(self.btn_add)
 
@@ -1646,6 +1840,7 @@ class HeroExpandedFolderOverlay(QWidget):
 
         self.morph_progress: float = 0.0
         self.is_closing: bool = False
+        self._modal_guard_count: int = 0
         self.setAcceptDrops(True)
 
         # Set screen viewport geometry
@@ -1659,17 +1854,11 @@ class HeroExpandedFolderOverlay(QWidget):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if parent is None:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
-        screen_obj = QApplication.screenAt(self.screen_geo.center())
-        try:
-            self.winId()
-            if self.windowHandle() and screen_obj:
-                self.windowHandle().setScreen(screen_obj)
-        except Exception:
-            pass
-
+        self._target_screen_obj = QApplication.screenAt(self.screen_geo.center())
         self.setGeometry(self.screen_geo)
 
         # Coordinate transformation relative to overlay screen viewport
@@ -1765,18 +1954,31 @@ class HeroExpandedFolderOverlay(QWidget):
         self.init_ui()
 
     def init_ui(self):
-        # Global frosted-glass tooltip styling
-        self.setStyleSheet("""
-            QToolTip {
-                background-color: rgba(22, 24, 32, 238);
-                color: #f5f5f7;
-                border: 1px solid rgba(255, 255, 255, 38);
-                border-radius: 8px;
-                padding: 6px 10px;
-                font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei UI";
-                font-size: 12px;
-            }
-        """)
+        is_light = (self.theme == "light")
+        if is_light:
+            self.setStyleSheet("""
+                QToolTip {
+                    background-color: rgba(248, 250, 252, 246);
+                    color: #0f172a;
+                    border: 1px solid rgba(15, 23, 42, 26);
+                    border-radius: 8px;
+                    padding: 5px 10px;
+                    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                    font-size: 12px;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QToolTip {
+                    background-color: rgba(20, 22, 30, 242);
+                    color: #f8fafc;
+                    border: 1px solid rgba(255, 255, 255, 34);
+                    border-radius: 8px;
+                    padding: 5px 10px;
+                    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                    font-size: 12px;
+                }
+            """)
 
         # Sheet inner layout
         sheet_box = QVBoxLayout(self.sheet)
@@ -1793,7 +1995,7 @@ class HeroExpandedFolderOverlay(QWidget):
 
         # Search icon toggle button (Vector antialiased)
         self.search_btn = VectorIconButton("search", size=32, parent=self.content_container)
-        self.search_btn.setToolTip("搜索应用 (快捷键: 任意输入)")
+        self.search_btn.setToolTip("搜索")
         self.search_btn.clicked.connect(self.toggle_search_input)
         header_bar.addWidget(self.search_btn)
 
@@ -1801,37 +2003,53 @@ class HeroExpandedFolderOverlay(QWidget):
 
         header_bar.addStretch()
 
-        # Large Folder Title (Inline editable)
+        # Confident Folder Title (18px DemiBold, inline editable)
         self.title_edit = QLineEdit(self.folder_name, self.content_container)
         self.title_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.title_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.title_edit.setStyleSheet("""
-            QLineEdit {
-                background: transparent;
-                color: #ffffff;
-                font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei";
-                font-size: 18px;
-                font-weight: bold;
-                border: 1px solid transparent;
-                border-radius: 8px;
-                padding: 2px 14px;
-                letter-spacing: 0.5px;
-            }
-            QLineEdit:hover {
-                border: 1px solid rgba(255, 255, 255, 40);
-                background: rgba(255, 255, 255, 15);
-            }
-            QLineEdit:focus {
-                border: 1.5px solid rgba(80, 160, 255, 200);
-                background: rgba(0, 0, 0, 60);
-            }
-        """)
-        if self.theme == "light":
-            self.title_edit.setStyleSheet(
-                self.title_edit.styleSheet() +
-                "\nQLineEdit { color: #0f172a; }"
-                "\nQLineEdit:hover { background: rgba(15, 23, 42, 0.06); }"
-                "\nQLineEdit:focus { color: #0f172a; background: rgba(255, 255, 255, 0.92); }")
+        self.title_edit.setFont(_ui_font(18, QFont.Weight.DemiBold))
+        if is_light:
+            self.title_edit.setStyleSheet("""
+                QLineEdit {
+                    background: transparent;
+                    color: #0f172a;
+                    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                    font-size: 18px;
+                    font-weight: 600;
+                    border: 1px solid transparent;
+                    border-radius: 8px;
+                    padding: 2px 14px;
+                }
+                QLineEdit:hover {
+                    border: 1px solid rgba(15, 23, 42, 0.10);
+                    background: rgba(15, 23, 42, 0.05);
+                }
+                QLineEdit:focus {
+                    border: 1px solid rgba(59, 130, 246, 0.65);
+                    background: rgba(255, 255, 255, 0.94);
+                }
+            """)
+        else:
+            self.title_edit.setStyleSheet("""
+                QLineEdit {
+                    background: transparent;
+                    color: #f8fafc;
+                    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                    font-size: 18px;
+                    font-weight: 600;
+                    border: 1px solid transparent;
+                    border-radius: 8px;
+                    padding: 2px 14px;
+                }
+                QLineEdit:hover {
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    background: rgba(255, 255, 255, 0.06);
+                }
+                QLineEdit:focus {
+                    border: 1px solid rgba(59, 130, 246, 0.65);
+                    background: rgba(255, 255, 255, 0.09);
+                }
+            """)
         self.title_edit.editingFinished.connect(self.on_title_edited)
         header_bar.addWidget(self.title_edit)
 
@@ -1839,7 +2057,7 @@ class HeroExpandedFolderOverlay(QWidget):
 
         # Settings button (Vector antialiased control sliders)
         self.settings_btn = VectorIconButton("settings", size=32, parent=self.content_container)
-        self.settings_btn.setToolTip("文件夹设置与应用打开方式")
+        self.settings_btn.setToolTip("文件夹选项")
         self.settings_btn.clicked.connect(self.show_drawer_settings_menu)
         header_bar.addWidget(self.settings_btn)
 
@@ -1853,29 +2071,54 @@ class HeroExpandedFolderOverlay(QWidget):
 
         # 2. Sleek Slide-Down Search Bar
         self.search_input = SearchLineEdit(self, self.content_container)
-        self.search_input.setPlaceholderText("键入应用、全盘文件 (Everything)、数学算式或网址...")
-        self.search_input.setStyleSheet("""
-            QLineEdit {
-                background-color: rgba(0, 0, 0, 55);
-                color: #ffffff;
-                border: 1px solid rgba(255, 255, 255, 38);
-                border-radius: 14px;
-                padding: 8px 16px;
-                font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei";
-                font-size: 13px;
-            }
-            QLineEdit:focus {
-                border: 1.5px solid rgba(80, 160, 255, 220);
-                background-color: rgba(0, 0, 0, 75);
-            }
-        """)
-        if self.theme == "light":
-            self.search_input.setStyleSheet(
-                self.search_input.styleSheet() +
-                "\nQLineEdit { color: #0f172a; background-color: rgba(255, 255, 255, 0.92); }"
-                "\nQLineEdit:focus { color: #0f172a; background-color: rgba(255, 255, 255, 0.98); }")
+        self.search_input.setPlaceholderText("搜索应用、文件、算式或网址...")
+        self.search_input.setFixedHeight(36)
+        self.search_input.setFont(_ui_font(13, QFont.Weight.Normal))
+        if is_light:
+            self.search_input.setStyleSheet("""
+                QLineEdit {
+                    background-color: rgba(15, 23, 42, 0.045);
+                    color: #0f172a;
+                    border: 1px solid rgba(15, 23, 42, 0.10);
+                    border-radius: 10px;
+                    padding: 7px 14px;
+                    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                    font-size: 13px;
+                }
+                QLineEdit:hover {
+                    background-color: rgba(15, 23, 42, 0.065);
+                    border: 1px solid rgba(15, 23, 42, 0.16);
+                }
+                QLineEdit:focus {
+                    background-color: rgba(255, 255, 255, 0.96);
+                    border: 1px solid rgba(59, 130, 246, 0.65);
+                }
+            """)
             pal = self.search_input.palette()
             pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#64748b"))
+            self.search_input.setPalette(pal)
+        else:
+            self.search_input.setStyleSheet("""
+                QLineEdit {
+                    background-color: rgba(255, 255, 255, 0.06);
+                    color: #f8fafc;
+                    border: 1px solid rgba(255, 255, 255, 0.10);
+                    border-radius: 10px;
+                    padding: 7px 14px;
+                    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                    font-size: 13px;
+                }
+                QLineEdit:hover {
+                    background-color: rgba(255, 255, 255, 0.08);
+                    border: 1px solid rgba(255, 255, 255, 0.16);
+                }
+                QLineEdit:focus {
+                    background-color: rgba(255, 255, 255, 0.09);
+                    border: 1px solid rgba(59, 130, 246, 0.65);
+                }
+            """)
+            pal = self.search_input.palette()
+            pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(148, 163, 184, 185))
             self.search_input.setPalette(pal)
         self._search_debounce_timer = QTimer(self)
         self._search_debounce_timer.setSingleShot(True)
@@ -1898,31 +2141,33 @@ class HeroExpandedFolderOverlay(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll.setStyleSheet("""
-            QScrollArea {
+        handle_idle = "rgba(15, 23, 42, 42)" if is_light else "rgba(255, 255, 255, 45)"
+        handle_hover = "rgba(15, 23, 42, 85)" if is_light else "rgba(255, 255, 255, 95)"
+        self.scroll.setStyleSheet(f"""
+            QScrollArea {{
                 background: transparent;
                 border: none;
-            }
-            QScrollBar:vertical {
+            }}
+            QScrollBar:vertical {{
                 background: transparent;
-                width: 8px;
-                margin: 4px 2px 4px 2px;
-            }
-            QScrollBar::handle:vertical {
-                background: rgba(255, 255, 255, 55);
-                border-radius: 4px;
+                width: 6px;
+                margin: 4px 1px 4px 1px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {handle_idle};
+                border-radius: 3px;
                 min-height: 28px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: rgba(255, 255, 255, 110);
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {handle_hover};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
                 height: 0px;
                 background: transparent;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
                 background: transparent;
-            }
+            }}
         """)
 
         self.scroll.setAcceptDrops(True)
@@ -1944,8 +2189,9 @@ class HeroExpandedFolderOverlay(QWidget):
             drop_target.setAcceptDrops(True)
             drop_target.installEventFilter(self)
 
-        # 4. Minimalist Footer (Clean breathing margin, eliminate tacky AI prompt hints)
+        # 4. Minimalist Footer
         self.count_lbl = QLabel(f"共 {len(self.items)} 项应用", self.content_container)
+        self.count_lbl.setFont(_ui_font(12, QFont.Weight.Normal))
         self.count_lbl.hide()
 
         self.refresh_subgroups()
@@ -1963,6 +2209,20 @@ class HeroExpandedFolderOverlay(QWidget):
             except Exception:
                 pass
             self._morph_anim_connection = None
+
+    @contextmanager
+    def _modal_guard(self):
+        self._modal_guard_count = getattr(self, "_modal_guard_count", 0) + 1
+        try:
+            yield
+        finally:
+            self._modal_guard_count = max(0, getattr(self, "_modal_guard_count", 1) - 1)
+            if self._modal_guard_count == 0 and self.isVisible() and not getattr(self, "is_closing", False):
+                try:
+                    self.raise_()
+                    self.activateWindow()
+                except Exception:
+                    pass
 
     def open_animated(self):
         """Starts the in-place Hero expansion from local_start_rect to local_target_rect"""
@@ -1982,6 +2242,7 @@ class HeroExpandedFolderOverlay(QWidget):
         self.morph_anim.setDuration(180)
         self.morph_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.morph_anim.start()
+        self.update()
 
     def _on_opened(self):
         self._disconnect_morph_finished()
@@ -1997,6 +2258,9 @@ class HeroExpandedFolderOverlay(QWidget):
             return
         self.is_closing = True
         self._finish_callback = on_finished
+        if hasattr(self, "_search_debounce_timer") and self._search_debounce_timer:
+            self._search_debounce_timer.stop()
+        self.morph_anim.stop()
 
         # Re-attach opacity effect for smooth fade out during collapse
         if not self.content_container.graphicsEffect():
@@ -2009,7 +2273,6 @@ class HeroExpandedFolderOverlay(QWidget):
             self._on_collapse_finished()
             return
 
-        self.morph_anim.stop()
         self._connect_morph_finished(self._on_collapse_finished)
 
         self.morph_anim.setStartValue(self.morph_progress)
@@ -2111,13 +2374,21 @@ class HeroExpandedFolderOverlay(QWidget):
                 return
         super().mousePressEvent(event)
 
+    def showEvent(self, event):
+        if self.windowHandle() and getattr(self, "_target_screen_obj", None):
+            try:
+                self.windowHandle().setScreen(self._target_screen_obj)
+            except Exception:
+                pass
+        super().showEvent(event)
+
     def changeEvent(self, event):
         """
         Detects window activation loss (e.g. user Alt+Tabs or switches to another program).
         Automatically dismisses the overlay so it never stays stuck on top of external applications.
         """
         if event.type() == QEvent.Type.ActivationChange:
-            if not self.isActiveWindow():
+            if not self.isActiveWindow() and getattr(self, "_modal_guard_count", 0) == 0:
                 if not QApplication.activeModalWidget() and not QApplication.activePopupWidget():
                     self.collapse_and_close()
         super().changeEvent(event)
@@ -2132,7 +2403,7 @@ class HeroExpandedFolderOverlay(QWidget):
             msg = wintypes.MSG.from_address(message.__int__())
             if msg.message == 0x0006:  # WM_ACTIVATE
                 wparam = msg.wParam & 0xFFFF
-                if wparam == 0:  # WA_INACTIVE
+                if wparam == 0 and getattr(self, "_modal_guard_count", 0) == 0:  # WA_INACTIVE
                     if not QApplication.activeModalWidget() and not QApplication.activePopupWidget():
                         try:
                             # Immediately strip topmost z-order so it never obscures the switched window
@@ -2269,13 +2540,18 @@ class HeroExpandedFolderOverlay(QWidget):
         painter.end()
 
     def closeEvent(self, event):
+        if hasattr(self, "_search_debounce_timer") and self._search_debounce_timer:
+            self._search_debounce_timer.stop()
+        if hasattr(self, "morph_anim") and self.morph_anim:
+            self.morph_anim.stop()
+        self._disconnect_morph_finished()
         self.closed.emit()
         super().closeEvent(event)
 
     def show_search_input(self, focus: bool = True):
         if not self.search_input.isVisible():
             self.search_input.show()
-            self.search_btn.icon_type = "close"
+            self.search_btn.is_active = True
             self.search_btn.update()
             if self.sheet.height() < 420:
                 cur_geo = self.sheet.geometry()
@@ -2289,7 +2565,7 @@ class HeroExpandedFolderOverlay(QWidget):
         if self.search_input.isVisible():
             self.search_input.hide()
             self.search_input.clear()
-            self.search_btn.icon_type = "search"
+            self.search_btn.is_active = False
             self.search_btn.update()
             self.setFocus()
             if hasattr(self, "local_target_rect"):
@@ -2310,6 +2586,9 @@ class HeroExpandedFolderOverlay(QWidget):
             self.setFocus()
 
     def _on_search_input_changed(self, text: str):
+        if getattr(self, "is_closing", False):
+            self._search_debounce_timer.stop()
+            return
         if not text.strip():
             self._search_debounce_timer.stop()
             self.on_search_text_changed(text)
@@ -2317,6 +2596,8 @@ class HeroExpandedFolderOverlay(QWidget):
             self._search_debounce_timer.start()
 
     def _on_search_debounced(self):
+        if getattr(self, "is_closing", False):
+            return
         self.on_search_text_changed(self.search_input.text())
 
     def on_search_text_changed(self, text: str, reset_selection: bool = True):
@@ -2466,19 +2747,21 @@ class HeroExpandedFolderOverlay(QWidget):
             self.subgroup_tab_bar.hide()
 
     def apply_current_filters(self):
-        # 1. Filter by active subgroup
+        # If search bar is open with an active query, preserve full Spotlight pipeline (math/web/sys_cmd/Everything)
+        query = self.search_input.text().strip() if (hasattr(self, "search_input") and not self.search_input.isHidden()) else ""
+        if query:
+            self.on_search_text_changed(query, reset_selection=False)
+            return
+
         if self.active_subgroup == "全部":
             filtered = list(self.items)
         else:
             filtered = [it for it in self.items if self._item_matches_subgroup(it, self.active_subgroup)]
 
-        # 2. Filter by search query if search is visible and active
-        query = self.search_input.text().strip() if (hasattr(self, "search_input") and self.search_input.isVisible()) else ""
-        if query:
-            filtered = search_items(filtered, query)
-
+        self.special_items = []
         self.action_items = list(filtered)
         self.current_display_items = list(filtered)
+        self.selected_item_index = min(max(0, self.selected_item_index), max(0, len(self.action_items) - 1))
         self.count_lbl.setText(f"共 {len(filtered)} 项应用")
         self.populate_grid(self.action_items)
 
@@ -2487,14 +2770,16 @@ class HeroExpandedFolderOverlay(QWidget):
         self.apply_current_filters()
 
     def on_add_subgroup_requested(self):
-        new_name, ok = ModernInputDialog.getText(self, "新建子分组", "请输入子分组名称 (例如: 常用套件、设计工具):")
+        with self._modal_guard():
+            new_name, ok = ModernInputDialog.getText(self, "新建子分组", "请输入子分组名称 (例如: 常用套件、设计工具):")
         if ok and new_name.strip():
             self.active_subgroup = new_name.strip()
             self.refresh_subgroups()
             self.apply_current_filters()
 
     def on_rename_subgroup_requested(self, old_name: str):
-        new_name, ok = ModernInputDialog.getText(self, "重命名子分组", f"请输入【{old_name}】的新名称:", text=old_name)
+        with self._modal_guard():
+            new_name, ok = ModernInputDialog.getText(self, "重命名子分组", f"请输入【{old_name}】的新名称:", text=old_name)
         if ok and new_name.strip() and new_name.strip() != old_name:
             for idx, it in enumerate(self.items):
                 if it.get("subgroup") == old_name:
@@ -2537,12 +2822,13 @@ class HeroExpandedFolderOverlay(QWidget):
     def show_add_local_app_dialog(self):
         """弹出本地应用选择器，直接批量加入当前大文件夹"""
         desktop_dir = os.path.expandvars(r"%USERPROFILE%\Desktop")
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            f"选择要添加到【{self.folder_name}】的应用或文件",
-            desktop_dir,
-            "常用程序与文件 (*.exe *.lnk *.url *.bat *.cmd *.pdf *.docx *.xlsx *.txt);;所有文件 (*.*)"
-        )
+        with self._modal_guard():
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                f"选择要添加到【{self.folder_name}】的应用或文件",
+                desktop_dir,
+                "常用程序与文件 (*.exe *.lnk *.url *.bat *.cmd *.pdf *.docx *.xlsx *.txt);;所有文件 (*.*)"
+            )
         if files:
             added = 0
             for fp in files:
@@ -2578,11 +2864,15 @@ class HeroExpandedFolderOverlay(QWidget):
     def show_add_web_bookmark_dialog(self):
         initial_sg = self.active_subgroup if self.active_subgroup != "全部" else "网页书签"
         dlg = AddWebBookmarkDialog(
-            self,
+            None,
             initial_subgroup=initial_sg,
-            existing_subgroups=self.get_all_subgroups()
+            existing_subgroups=self.get_all_subgroups(),
+            theme=self.theme,
         )
-        if dlg.exec():
+        dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        with self._modal_guard():
+            accepted = dlg.exec()
+        if accepted:
             bm = dlg.get_bookmark_data()
             if bm:
                 self.web_items_dropped.emit([bm], -1)
@@ -2681,7 +2971,7 @@ class HeroExpandedFolderOverlay(QWidget):
         real_items = [it for it in new_items if it and (it.get("path") or it.get("name"))]
         self.items = real_items
         self.refresh_subgroups()
-        if hasattr(self, "search_input") and self.search_input.isVisible() and self.search_input.text().strip():
+        if hasattr(self, "search_input") and not self.search_input.isHidden() and self.search_input.text().strip():
             self.on_search_text_changed(self.search_input.text(), reset_selection=False)
         else:
             self.apply_current_filters()
@@ -2701,7 +2991,7 @@ class HeroExpandedFolderOverlay(QWidget):
                 self.items.pop(idx)
                 self.item_removed.emit(idx)
                 self.refresh_subgroups()
-                if hasattr(self, "search_input") and self.search_input.isVisible() and self.search_input.text().strip():
+                if hasattr(self, "search_input") and not self.search_input.isHidden() and self.search_input.text().strip():
                     self.on_search_text_changed(self.search_input.text())
                 else:
                     self.apply_current_filters()
@@ -2711,17 +3001,20 @@ class HeroExpandedFolderOverlay(QWidget):
         self.keyboard_nav_active = True
         key = event.key()
         total = len(self.action_items)
+        if total > 0:
+            self.selected_item_index = min(max(0, self.selected_item_index), total - 1)
+        else:
+            self.selected_item_index = 0
 
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            target_idx = self.selected_item_index if 0 <= self.selected_item_index < total else (0 if total > 0 else -1)
-            if target_idx >= 0:
-                selected_item = self.action_items[target_idx]
+            if total > 0:
+                selected_item = self.action_items[self.selected_item_index]
                 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) and selected_item.get("type") == "file":
                     self.launch_file_item(selected_item, open_folder=True)
                 else:
                     self.execute_item(selected_item)
-                event.accept()
-                return
+            event.accept()
+            return
         elif key == Qt.Key.Key_Escape:
             self.collapse_and_close()
             event.accept()
@@ -2730,34 +3023,40 @@ class HeroExpandedFolderOverlay(QWidget):
             if total > 0:
                 self.selected_item_index = (self.selected_item_index + 1) % total
                 self.update_selection_highlight()
-                event.accept()
-                return
+            event.accept()
+            return
         elif key in (Qt.Key.Key_Left, Qt.Key.Key_Backtab):
             if total > 0:
                 self.selected_item_index = (self.selected_item_index - 1 + total) % total
                 self.update_selection_highlight()
-                event.accept()
-                return
+            event.accept()
+            return
         elif key == Qt.Key.Key_Down:
             if total > 0:
-                col_step = getattr(self, "grid_cols", 4)
+                col_step = max(1, int(getattr(self, "grid_cols", 4)))
                 curr_item = self.action_items[self.selected_item_index]
                 if curr_item.get("type") in ("math", "web", "sys_cmd", "file"):
                     self.selected_item_index = min(total - 1, self.selected_item_index + 1)
                 else:
                     next_idx = self.selected_item_index + col_step
-                    if next_idx < total and self.action_items[next_idx].get("type") in ("math", "web", "sys_cmd", "file"):
-                        self.selected_item_index = next_idx
-                    elif next_idx < total:
+                    if next_idx < total:
                         self.selected_item_index = next_idx
                     else:
-                        self.selected_item_index = min(total - 1, self.selected_item_index + 1)
+                        first_app_idx = len(self.special_items)
+                        curr_app_row = max(0, self.selected_item_index - first_app_idx) // col_step
+                        last_item = self.action_items[total - 1]
+                        if last_item.get("type") in ("math", "web", "sys_cmd", "file"):
+                            self.selected_item_index = total - 1
+                        else:
+                            last_app_row = max(0, (total - 1) - first_app_idx) // col_step
+                            if last_app_row > curr_app_row:
+                                self.selected_item_index = total - 1
                 self.update_selection_highlight()
-                event.accept()
-                return
+            event.accept()
+            return
         elif key == Qt.Key.Key_Up:
             if total > 0:
-                col_step = getattr(self, "grid_cols", 4)
+                col_step = max(1, int(getattr(self, "grid_cols", 4)))
                 curr_item = self.action_items[self.selected_item_index]
                 if curr_item.get("type") in ("math", "web", "sys_cmd", "file"):
                     self.selected_item_index = max(0, self.selected_item_index - 1)
@@ -2771,8 +3070,8 @@ class HeroExpandedFolderOverlay(QWidget):
                     else:
                         self.selected_item_index = max(0, self.selected_item_index - col_step)
                 self.update_selection_highlight()
-                event.accept()
-                return
+            event.accept()
+            return
         elif (event.modifiers() & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_F) or key == Qt.Key.Key_Slash:
             self.show_search_input(focus=True)
             event.accept()
@@ -2843,16 +3142,16 @@ class HeroExpandedFolderOverlay(QWidget):
         try:
             if open_folder:
                 if os.path.exists(full_path):
-                    subprocess.Popen(f'explorer /select,"{full_path}"')
+                    subprocess.Popen(["explorer.exe", f"/select,{os.path.abspath(full_path)}"])
                 else:
                     dir_path = item_data.get("dir", "")
                     if os.path.exists(dir_path):
-                        os.startfile(dir_path)
+                        safe_launch_target(dir_path)
             else:
                 if os.path.exists(full_path):
-                    os.startfile(full_path)
+                    safe_launch_target(full_path)
                 else:
-                    subprocess.Popen(f'explorer /select,"{full_path}"')
+                    subprocess.Popen(["explorer.exe", f"/select,{os.path.abspath(full_path)}"])
         except Exception as e:
             print("Failed to open Everything search result:", e)
 
@@ -2872,17 +3171,7 @@ class HeroExpandedFolderOverlay(QWidget):
         if should_close:
             self.collapse_and_close()
         try:
-            url_target = resolve_url_shortcut(path)
-            if url_target:
-                os.startfile(url_target)
-            elif path.startswith("http://") or path.startswith("https://"):
-                os.startfile(path)
-            elif args:
-                subprocess.Popen(f'"{path}" {args}', shell=True)
-            elif os.path.exists(path):
-                os.startfile(path)
-            else:
-                subprocess.Popen(raw_path, shell=True)
+            safe_launch_target(raw_path, args)
         except Exception as e:
             print("Failed to launch from expanded folder:", e)
 
@@ -2903,38 +3192,15 @@ class HeroExpandedFolderOverlay(QWidget):
 
     def show_drawer_settings_menu(self):
         menu = QMenu(self)
-        menu.setStyleSheet("""
-        QMenu {
-            background-color: rgba(24, 26, 34, 248);
-            color: #f5f5f5;
-            border: 1px solid rgba(255, 255, 255, 45);
-            border-radius: 12px;
-            padding: 6px;
-            font-family: "Segoe UI Variable Display", "Segoe UI", "PingFang SC", "Microsoft YaHei";
-            font-size: 13px;
-        }
-        QMenu::item {
-            padding: 6px 20px;
-            border-radius: 6px;
-        }
-        QMenu::item:selected {
-            background-color: rgba(255, 255, 255, 45);
-            color: #ffffff;
-        }
-        QMenu::separator {
-            height: 1px;
-            background-color: rgba(255, 255, 255, 25);
-            margin: 4px 6px;
-        }
-        """)
+        menu.setStyleSheet(_get_menu_qss(self.theme))
 
         open_mode_menu = menu.addMenu("打开方式")
         open_mode_menu.setStyleSheet(menu.styleSheet())
         curr_open_mode = getattr(self, "open_app_mode", "double")
         open_modes = [
-            ("double", "双击打开 (推荐 · 防误触优先 · 键鼠桌面首选)"),
-            ("hybrid", "双层模式 (外层卡片单击 · 展开抽屉双击防误触)"),
-            ("single", "单击打开 (极速仿手机 · 适合触屏或快速启动)"),
+            ("double", "双击打开（推荐）"),
+            ("hybrid", "双层模式（卡片单击 · 抽屉双击）"),
+            ("single", "单击打开"),
         ]
         for m_k, m_name in open_modes:
             prefix = "● " if curr_open_mode == m_k else "○ "

@@ -13,6 +13,7 @@ import json
 import re
 import ssl
 import ctypes
+import atexit
 import asyncio
 import base64
 import threading
@@ -56,6 +57,13 @@ class MediaControlService(QObject):
             cls._instance = MediaControlService()
         return cls._instance
 
+    @classmethod
+    def shutdown_instance(cls):
+        """安全关闭已初始化的单例服务（未初始化时不额外实例化）。"""
+        inst = cls._instance
+        if inst is not None:
+            inst.shutdown()
+
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._current_info: Dict[str, Any] = {
@@ -76,6 +84,8 @@ class MediaControlService(QObject):
         self._mock_info: Optional[Dict[str, Any]] = None
 
         self._is_polling_active = False
+        self._shutting_down = False
+        self._executor_lock = threading.RLock()
         self._last_position: Optional[float] = None
         self._last_duration: float = 0.0
         self._stuck_count = 0
@@ -95,6 +105,53 @@ class MediaControlService(QObject):
         self._refresh_requested.connect(self._refresh_timer.start)
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="GSMTCWorker")
 
+    def _ensure_executor(self):
+        with self._executor_lock:
+            if self._executor is None or getattr(self._executor, "_shutdown", False):
+                self._executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="GSMTCWorker"
+                )
+            return self._executor
+
+    def shutdown(self):
+        """优雅关闭轮询定时器与后台线程池，杜绝退出时 ThreadPoolExecutor atexit 卡死成为僵尸进程。"""
+        self._shutting_down = True
+        for timer_attr in ("_poll_timer", "_refresh_timer"):
+            timer = getattr(self, timer_attr, None)
+            if timer is not None:
+                try:
+                    if timer.isActive():
+                        timer.stop()
+                except Exception:
+                    pass
+
+        self._manager = None
+        self._manager_tokens = []
+        self._subscribed_session = None
+        self._session_tokens = []
+        self._is_polling_active = False
+
+        with self._executor_lock:
+            executor = getattr(self, "_executor", None)
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    try:
+                        executor.shutdown(wait=False)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    import concurrent.futures.thread as _cft
+                    for t in list(getattr(executor, "_threads", ())):
+                        _cft._threads_queues.pop(t, None)
+                except Exception:
+                    pass
+
+    stop = shutdown
+
     def set_mock_data(self, mock_info: Optional[Dict[str, Any]]):
         """用于单元测试或演示模式的模拟媒体数据"""
         self._mock_mode = mock_info is not None
@@ -111,6 +168,8 @@ class MediaControlService(QObject):
         return self._seek_supported
 
     def start_polling(self, interval_ms: int = 1200):
+        self._shutting_down = False
+        self._ensure_executor()
         if not self._poll_timer.isActive():
             self._poll_timer.setInterval(interval_ms)
             self._poll_timer.start()
@@ -130,6 +189,8 @@ class MediaControlService(QObject):
 
     def poll_current_session(self):
         """触发异步抓取当前会话媒体元数据 (复用持久线程池，彻底消除高频线程创建/销毁开销)"""
+        if self._shutting_down:
+            return
         if self._mock_mode and self._mock_info:
             return
 
@@ -142,20 +203,24 @@ class MediaControlService(QObject):
         self._is_polling_active = True
 
         try:
-            self._executor.submit(self._async_worker_poll)
+            executor = self._ensure_executor()
+            executor.submit(self._async_worker_poll)
         except Exception:
             self._is_polling_active = False
 
     def _async_worker_poll(self):
         #  executor 只有一个常驻线程，事件循环复用即可；每 500ms 新建/销毁
         #  一个 loop 会持续产生 asyncio/WinRT 临时对象，是轮询路径最大的分配源。
+        if self._shutting_down:
+            self._is_polling_active = False
+            return
         try:
             loop = getattr(self, "_worker_loop", None)
             if loop is None or loop.is_closed():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 self._worker_loop = loop
-            loop.run_until_complete(self._fetch_gsmtc_info())
+            loop.run_until_complete(asyncio.wait_for(self._fetch_gsmtc_info(), timeout=2.5))
         except Exception:
             self._worker_loop = None
         finally:
@@ -163,6 +228,8 @@ class MediaControlService(QObject):
 
     def _emit_refresh(self, *args):
         """GSMTC 事件回调入口（COM 线程）→ 主线程防抖刷新。"""
+        if self._shutting_down:
+            return
         try:
             self._refresh_requested.emit()
         except Exception:
@@ -432,12 +499,12 @@ class MediaControlService(QObject):
                         sess = await self._resolve_active_session(mgr)
                         if sess:
                             await sess.try_toggle_play_pause_async()
-                loop.run_until_complete(_task())
+                loop.run_until_complete(asyncio.wait_for(_task(), timeout=2.0))
                 loop.close()
             except Exception:
                 pass
-            # 立即触发一次状态刷新
-            QTimer.singleShot(150, self.poll_current_session)
+            # 经 Qt 信号回到主线程防抖刷新（裸线程禁止直接调用 QTimer.singleShot）
+            self._emit_refresh()
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -461,7 +528,7 @@ class MediaControlService(QObject):
                     if sess:
                         await sess.try_change_playback_position_async(int(float(seconds) * 10_000_000))
 
-                loop.run_until_complete(_task())
+                loop.run_until_complete(asyncio.wait_for(_task(), timeout=2.0))
                 loop.close()
             except Exception:
                 pass
@@ -473,7 +540,7 @@ class MediaControlService(QObject):
                     seek_qqmusic(float(seconds), self._last_duration)
                 except Exception:
                     pass
-            QTimer.singleShot(150, self.poll_current_session)
+            self._emit_refresh()
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -517,7 +584,7 @@ class MediaControlService(QObject):
                                 await sess.try_skip_next_async()
                             else:
                                 await sess.try_skip_previous_async()
-                loop.run_until_complete(_task())
+                loop.run_until_complete(asyncio.wait_for(_task(), timeout=2.0))
                 loop.close()
             except Exception:
                 pass
@@ -618,7 +685,10 @@ class LyricsService(QObject):
         if self._last_key != key:
             return
         self._lines = lines
-        self.lyrics_ready.emit(list(lines))
+        try:
+            self.lyrics_ready.emit(list(lines))
+        except RuntimeError:
+            pass
 
     def _from_kugou(self, title, artist, duration):
         clean = re.sub(r"\s*[（(].*?[)）]", "", title).strip() or title
@@ -715,3 +785,9 @@ def get_lyrics_service() -> LyricsService:
 
 def get_media_service() -> MediaControlService:
     return MediaControlService.get_instance()
+
+
+atexit.register(MediaControlService.shutdown_instance)
+
+sys.modules.setdefault("media_service", sys.modules[__name__])
+sys.modules.setdefault("stacky.media.media_service", sys.modules[__name__])

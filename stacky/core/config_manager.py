@@ -1,20 +1,20 @@
-from stacky.paths import ROOT
+from stacky.paths import ROOT, get_user_data_dir
 import os
 import sys
 import json
+import shutil
+import threading
+import time
 from typing import Dict, Any, List, Optional
 
 def get_default_config_path() -> str:
+    data_dir = get_user_data_dir()
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        # 用户级持久目录：卸载、重装、换安装路径都不会丢卡片与小组件位置
-        appdata_dir = os.path.join(os.environ.get("APPDATA", exe_dir), "Stacky")
-        os.makedirs(appdata_dir, exist_ok=True)
-        user_cfg = os.path.join(appdata_dir, "config.json")
-        if os.path.exists(user_cfg):
+        user_cfg = os.path.join(data_dir, "config.json")
+        if os.path.exists(user_cfg) or os.path.exists(os.path.join(exe_dir, "portable.flag")):
             return user_cfg
         # 首次升级：把旧的程序目录配置迁过来，现有布局无损
-        import shutil
         for legacy in (
             os.path.join(exe_dir, "config.json"),
             os.path.join(exe_dir, "_internal", "config.json"),
@@ -27,7 +27,7 @@ def get_default_config_path() -> str:
                     pass
                 break
         return user_cfg
-    return os.path.join(ROOT, "config.json")
+    return os.path.join(data_dir, "config.json")
 
 CONFIG_FILE = get_default_config_path()
 
@@ -56,10 +56,15 @@ def get_default_items(include_desktop: bool = True) -> List[Dict[str, str]]:
     if include_desktop:
         desktop_dir = os.path.expandvars(r"%USERPROFILE%\Desktop")
         if os.path.exists(desktop_dir):
+            seen_names = {c["name"].strip().lower() for c in candidates}
+            self_skip_tokens = ("uninstall", "卸载", "stacky", "灵叠", "仿手机大文件夹", "deskbox")
             for f in os.listdir(desktop_dir):
-                if f.lower().endswith(".lnk") and not any(k in f.lower() for k in ["uninstall", "卸载"]):
+                f_low = f.lower()
+                if f_low.endswith(".lnk") and not any(k in f_low for k in self_skip_tokens):
                     name = os.path.splitext(f)[0]
-                    candidates.append({"name": name, "path": os.path.join(desktop_dir, f), "args": ""})
+                    if name.strip().lower() not in seen_names:
+                        seen_names.add(name.strip().lower())
+                        candidates.append({"name": name, "path": os.path.join(desktop_dir, f), "args": ""})
                 if len(candidates) >= 9:
                     break
 
@@ -181,6 +186,7 @@ class ConfigManager:
     """
     def __init__(self, config_path: str = CONFIG_FILE):
         self.config_path = config_path
+        self._save_lock = threading.RLock()
         self.data: Dict[str, Any] = self.load()
 
     def load(self) -> Dict[str, Any]:
@@ -191,10 +197,36 @@ class ConfigManager:
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     user_data = json.load(f)
-                    user_has_instances = "instances" in user_data and isinstance(user_data["instances"], list) and len(user_data["instances"]) > 0
-                    data.update(user_data)
+                if not isinstance(user_data, dict):
+                    raise ValueError("Root of config.json must be a JSON object")
+                user_has_instances = (
+                    "instances" in user_data
+                    and isinstance(user_data["instances"], list)
+                    and len(user_data["instances"]) > 0
+                )
+                data.update(user_data)
             except Exception as e:
-                print("Failed to read config.json, using defaults:", e)
+                print("Failed to read config.json, quarantining and attempting .bak recovery:", e)
+                corrupt_path = self.config_path + ".corrupt"
+                try:
+                    shutil.copyfile(self.config_path, corrupt_path)
+                except Exception:
+                    pass
+                bak_path = self.config_path + ".bak"
+                if os.path.exists(bak_path):
+                    try:
+                        with open(bak_path, "r", encoding="utf-8") as bf:
+                            bak_data = json.load(bf)
+                        if isinstance(bak_data, dict):
+                            user_data = bak_data
+                            user_has_instances = (
+                                "instances" in user_data
+                                and isinstance(user_data["instances"], list)
+                                and len(user_data["instances"]) > 0
+                            )
+                            data.update(user_data)
+                    except Exception as bak_err:
+                        print("Failed to recover from config.json.bak, using defaults:", bak_err)
 
         # Migration from legacy single-folder structure:
         # If user config has "items" or "folder_name" at root, migrate into "folders"
@@ -212,7 +244,7 @@ class ConfigManager:
             # If the first folder is empty and legacy_items is present, fill it
             if legacy_items and not data["folders"][0].get("items"):
                 data["folders"][0]["items"] = legacy_items
-            elif not data["folders"][0].get("items"):
+            elif not data["folders"][0].get("items") and not data["folders"][0].get("storage_mapped"):
                 data["folders"][0]["items"] = get_default_items()
 
         # Ensure active folder index is valid
@@ -257,20 +289,52 @@ class ConfigManager:
         return data
 
     def save(self, data: Dict[str, Any] = None):
-        if data is not None:
-            self.data = data
-        try:
-            # 覆盖前留一份上一版：配置里含用户全部卡片布局，误覆盖过一次就很难找回
-            if os.path.exists(self.config_path):
-                import shutil as _shutil
+        with self._save_lock:
+            if data is not None:
+                self.data = data
+            tmp_path = f"{self.config_path}.{os.getpid()}.tmp"
+            bak_path = self.config_path + ".bak"
+            try:
+                payload = json.dumps(self.data, ensure_ascii=False, indent=2)
+                cfg_dir = os.path.dirname(os.path.abspath(self.config_path))
+                if cfg_dir:
+                    os.makedirs(cfg_dir, exist_ok=True)
+
+                # 仅在现有 config.json 完整且可解析为合法 JSON dict 时才覆盖 .bak，绝不让截断/损坏文件污染备份
+                if os.path.exists(self.config_path):
+                    try:
+                        if os.path.getsize(self.config_path) > 10:
+                            with open(self.config_path, "r", encoding="utf-8") as old_f:
+                                parsed_old = json.load(old_f)
+                            if isinstance(parsed_old, dict):
+                                shutil.copyfile(self.config_path, bak_path)
+                    except Exception:
+                        pass
+
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+
                 try:
-                    _shutil.copyfile(self.config_path, self.config_path + ".bak")
-                except Exception:
-                    pass
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("Failed to save config.json:", e)
+                    os.replace(tmp_path, self.config_path)
+                except PermissionError:
+                    time.sleep(0.02)
+                    os.replace(tmp_path, self.config_path)
+
+                if not os.path.exists(bak_path):
+                    try:
+                        shutil.copyfile(self.config_path, bak_path)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print("Failed to save config.json:", e)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
     def get(self, key: str, default: Any = None) -> Any:
         # Backwards compatibility wrappers
@@ -768,5 +832,9 @@ class ConfigManager:
         self.data["post_launch_action"] = action
         if auto_save:
             self.save()
+
+
+sys.modules.setdefault("config_manager", sys.modules[__name__])
+sys.modules.setdefault("stacky.core.config_manager", sys.modules[__name__])
 
 

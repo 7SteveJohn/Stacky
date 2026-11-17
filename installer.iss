@@ -1,6 +1,6 @@
 ; Inno Setup 6 Script for Stacky (灵叠)
 #define MyAppName "Stacky 灵叠"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "Stacky Desktop Labs"
 #define MyAppExeName "BigFolderLauncher.exe"
 #define SourceAppDir "dist\BigFolderLauncher"
@@ -26,7 +26,7 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=force
-CloseApplicationsFilter=*.exe
+CloseApplicationsFilter=*.exe,*.dll,*.pyd
 RestartApplications=no
 UninstallDisplayIcon={app}\.cache_icons\app_icon.ico
 UninstallDisplayName={#MyAppName}
@@ -42,12 +42,13 @@ Name: "autostart"; Description: "开机自动启动"; GroupDescription: "{cm:Add
 [Files]
 ; 1. 保留用户个人配置与数据：更新/覆盖安装时绝对不覆盖现有 config.json！
 Source: "{#SourceAppDir}\config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
-; 2. 覆盖更新程序二进制与运行时组件
-;    VC++ 运行库单独处理：常被其它进程映射占用，覆盖时 DeleteFile 报「错误代码 5 拒绝访问」。
-;    这两个 DLL 各版本内容一致，已存在就跳过，全新安装才写入。
-Source: "{#SourceAppDir}\*"; DestDir: "{app}"; Excludes: "config.json,VCRUNTIME140.dll,VCRUNTIME140_1.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SourceAppDir}\_internal\VCRUNTIME140.dll"; DestDir: "{app}\_internal"; Flags: onlyifdoesntexist
-Source: "{#SourceAppDir}\_internal\VCRUNTIME140_1.dll"; DestDir: "{app}\_internal"; Flags: onlyifdoesntexist
+; 2. 完整覆盖更新程序二进制及 PySide6/VC++ 运行时组件（含只读属性强制覆盖与卸载清理）
+Source: "{#SourceAppDir}\*"; DestDir: "{app}"; Excludes: "config.json,*.old_locked_*"; Flags: ignoreversion recursesubdirs createallsubdirs overwritereadonly uninsremovereadonly
+
+[UninstallDelete]
+Type: files; Name: "{app}\*.old_locked_*"
+Type: files; Name: "{app}\_internal\*.old_locked_*"
+Type: files; Name: "{app}\_internal\PySide6\*.old_locked_*"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--activate"; IconFilename: "{app}\.cache_icons\app_icon.ico"
@@ -90,4 +91,123 @@ begin
   end;
   // 5. 首次全新安装默认路径
   Result := ExpandConstant('{localappdata}\Programs\BigFolderLauncher');
+end;
+
+function IsFileExclusivelyWritable(const FileName: String): Boolean;
+var
+  FS: TFileStream;
+begin
+  Result := True;
+  if not FileExists(FileName) then
+    Exit;
+  try
+    FS := TFileStream.Create(FileName, fmOpenReadWrite or fmShareExclusive);
+    FS.Free;
+  except
+    Result := False;
+  end;
+end;
+
+procedure PurgeAndSidestepLockedBinaries(const DirPath: String);
+var
+  FindRec: TFindRec;
+  FullPath, LowerName, Ext, Candidate: String;
+  Idx: Integer;
+begin
+  if not DirExists(DirPath) then
+    Exit;
+  if FindFirst(AddBackslash(DirPath) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          FullPath := AddBackslash(DirPath) + FindRec.Name;
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          begin
+            PurgeAndSidestepLockedBinaries(FullPath);
+          end
+          else
+          begin
+            LowerName := Lowercase(FindRec.Name);
+            if Pos('.old_locked_', LowerName) > 0 then
+            begin
+              // 自动清理历次升级遗留且已释放句柄的旧版副本
+              DeleteFile(FullPath);
+            end
+            else
+            begin
+              Ext := Lowercase(ExtractFileExt(FindRec.Name));
+              if (Ext = '.dll') or (Ext = '.pyd') or (Ext = '.exe') then
+              begin
+                if not IsFileExclusivelyWritable(FullPath) then
+                begin
+                  Idx := 1;
+                  Candidate := FullPath + '.old_locked_' + IntToStr(Idx);
+                  while FileExists(Candidate) and (Idx < 100) do
+                  begin
+                    if DeleteFile(Candidate) then
+                      Break;
+                    Idx := Idx + 1;
+                    Candidate := FullPath + '.old_locked_' + IntToStr(Idx);
+                  end;
+                  if RenameFile(FullPath, Candidate) then
+                    Log('Sidestepped third-party mapped binary via NTFS rename: ' + FullPath + ' -> ' + Candidate)
+                  else
+                    Log('Warning: Could not rename still-locked binary: ' + FullPath);
+                end;
+              end;
+            end;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  AppDir, AppExe, OpenGlDll: String;
+  ResultCode, I: Integer;
+  ExeUnlocked, GlUnlocked: Boolean;
+begin
+  Result := '';
+  NeedsRestart := False;
+  AppDir := ExpandConstant('{app}');
+  if not DirExists(AppDir) then
+    Exit;
+
+  AppExe := AddBackslash(AppDir) + '{#MyAppExeName}';
+  OpenGlDll := AddBackslash(AppDir) + '_internal\PySide6\opengl32sw.dll';
+
+  // 1. 优先通过 IPC 发送优雅退出指令 (--quit)
+  if FileExists(AppExe) then
+  begin
+    Exec(AppExe, '--quit', AppDir, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
+  // 2. 强制终止残留进程树，确保无后台常驻句柄
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // 3. 剥离安装目录下可能存在的只读属性，防止 DeleteFile 返回拒绝访问 (Error 5)
+  Exec(ExpandConstant('{sys}\attrib.exe'), '-R "' + AppDir + '\*" /S /D', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // 4. 轮询最多 25 次 (25 * 200ms = 5s)，等待 Windows 内核 MmFlushImageSection 完全释放映像节句柄
+  for I := 1 to 25 do
+  begin
+    ExeUnlocked := IsFileExclusivelyWritable(AppExe);
+    GlUnlocked := IsFileExclusivelyWritable(OpenGlDll);
+    if ExeUnlocked and GlUnlocked then
+      Break;
+    if (I mod 5 = 0) or (not ExeUnlocked) then
+    begin
+      Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+    Sleep(200);
+  end;
+
+  // 5. 兜底无感热替换：若外部长生命周期进程（如模拟器/IDE）仍映射占用某个 DLL，在同卷 NTFS 原位改名避让，避免误杀第三方进程且 100% 根除 DeleteFile Error 5
+  PurgeAndSidestepLockedBinaries(AppDir);
 end;

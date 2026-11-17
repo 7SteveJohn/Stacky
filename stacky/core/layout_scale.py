@@ -5,7 +5,10 @@ config 里的坐标与尺寸属于「布局画布」(layout_screen_w / layout_sc
 显示坐标；写回 config 时反向换算，保证任意分辨率下相对布局不变。
 """
 
+import sys
 from typing import Optional, Tuple
+
+from PySide6.QtCore import QRect
 
 MIN_SCALE = 0.30
 MAX_SCALE = 2.50
@@ -43,11 +46,13 @@ def compute_scale(canvas: Tuple[float, float], screen: Tuple[float, float]) -> f
 
 
 def to_screen(value, scale: float) -> int:
-    return int(round(float(value) * scale))
+    s = float(scale) if scale and scale > 0 else 1.0
+    return int(round(float(value) * s))
 
 
 def to_canvas(value, scale: float) -> int:
-    return int(round(float(value) / scale)) if scale > 0 else int(value)
+    s = float(scale) if scale and scale > 0 else 1.0
+    return int(round(float(value) / s))
 
 
 def current_screen_size() -> Optional[Tuple[int, int]]:
@@ -72,3 +77,37 @@ def scale_for_config(config_manager) -> float:
     if size is None:
         return 1.0
     return compute_scale((w, h), size)
+
+
+def screen_available_geometry_for_widget(win) -> Optional[QRect]:
+    """返回窗口当前所在屏幕的可用区域；仅在脱屏或显示器断开时回退主屏。"""
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        return None
+    primary = QApplication.primaryScreen()
+    screens = app.screens() if hasattr(app, "screens") else []
+    scr = None
+    if win is not None:
+        try:
+            if hasattr(win, "geometry") and callable(win.geometry):
+                center = win.geometry().center()
+            else:
+                center = QRect(
+                    int(win.x()), int(win.y()), int(win.width()), int(win.height())
+                ).center()
+            scr = QApplication.screenAt(center)
+        except Exception:
+            scr = None
+    if scr is not None and screens and scr is screens[0] and primary is not None:
+        scr = primary
+    if scr is None:
+        scr = primary
+    if scr is None:
+        return None
+    return scr.availableGeometry()
+
+
+sys.modules.setdefault("layout_scale", sys.modules[__name__])
+sys.modules.setdefault("stacky.core.layout_scale", sys.modules[__name__])

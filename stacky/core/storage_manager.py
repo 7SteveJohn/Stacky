@@ -49,6 +49,24 @@ def is_valid_fs_name(name: str) -> bool:
     return True
 
 
+_SELF_AND_CONTAINER_EXCLUDES = frozenset({
+    "stacky",
+    "stacky.lnk",
+    "stacky 灵叠",
+    "stacky 灵叠.lnk",
+    "stacky 灵叠启动台",
+    "stacky 灵叠启动台.lnk",
+    "stacky files",
+    "stacky files.lnk",
+    "仿手机大文件夹",
+    "仿手机大文件夹.lnk",
+    "仿手机大文件夹启动台",
+    "仿手机大文件夹启动台.lnk",
+    "deskbox files",
+    "deskbox files.lnk",
+})
+
+
 def default_managed_storage_root() -> str:
     """
     Returns the dedicated physical storage root for Stacky:
@@ -69,12 +87,20 @@ def default_managed_storage_root() -> str:
     try:
         if os.path.exists(stacky_path) and not os.listdir(stacky_path):
             legacy_dir = os.path.join(user_home, "DeskBox")  # 旧版固定目录名，互操作标识
+            skip_seed = _SELF_AND_CONTAINER_EXCLUDES | {"desktop.ini", "thumbs.db", ".ds_store", ".git", "deskbox.lnk"}
             if os.path.exists(legacy_dir) and os.path.isdir(legacy_dir):
                 for item in os.listdir(legacy_dir):
+                    if item.lower() in skip_seed or item.startswith(".") or item.startswith("~"):
+                        continue
                     s_src = os.path.join(legacy_dir, item)
                     s_dst = os.path.join(stacky_path, item)
                     if os.path.isdir(s_src):
-                        shutil.copytree(s_src, s_dst, dirs_exist_ok=True)
+                        shutil.copytree(
+                            s_src,
+                            s_dst,
+                            dirs_exist_ok=True,
+                            ignore=lambda _d, names: [n for n in names if n.lower() in skip_seed],
+                        )
                     else:
                         shutil.copy2(s_src, s_dst)
     except Exception:
@@ -184,7 +210,7 @@ def scan_directory_items(dir_path: str) -> List[Dict[str, Any]]:
         return []
 
     items: List[Dict[str, Any]] = []
-    ignored_exact = {"desktop.ini", "thumbs.db", ".ds_store", ".git"}
+    ignored_exact = {"desktop.ini", "thumbs.db", ".ds_store", ".git"} | _SELF_AND_CONTAINER_EXCLUDES
 
     try:
         entries = os.listdir(dir_path)
@@ -193,9 +219,9 @@ def scan_directory_items(dir_path: str) -> List[Dict[str, Any]]:
         return []
 
     for entry in entries:
-        if (entry.lower() in ignored_exact or entry.startswith(".")
-                or entry.startswith("~") or entry.lower().endswith(".tmp")
-                or entry.lower().endswith(".crdownload")):
+        entry_low = entry.lower()
+        if (entry_low in ignored_exact or entry.startswith(".")
+                or entry.startswith("~") or entry_low.endswith((".tmp", ".tmp_heal", ".part", ".partial", ".crdownload"))):
             continue
 
         full_path = os.path.join(dir_path, entry)
@@ -672,7 +698,8 @@ class ManagedStorageEngine(QObject):
                             self.sync_folder_from_storage(real_name, force=True)
                             break
 
-        self.config_manager.set_active_folder_index(orig_active)
+        if self.config_manager.get_active_folder_index() != orig_active:
+            self.config_manager.set_active_folder_index(orig_active)
         if imported:
             self.storage_folders_imported.emit(imported)
         return imported
@@ -697,37 +724,56 @@ class ManagedStorageEngine(QObject):
                     self._unwatch_directory(self.get_folder_storage_path(folder_name))
                 break
 
+    @staticmethod
+    def _is_virtual_bookmark_item(item: Dict[str, Any]) -> bool:
+        if not isinstance(item, dict):
+            return False
+        if item.get("type") == "web":
+            return True
+        p = str(item.get("path") or "").strip().lower()
+        return p.startswith(("http://", "https://")) and not p.endswith(".url")
+
     def sync_folder_from_storage(self, folder_name: str, force: bool = False) -> List[Dict[str, Any]]:
         """
         Scans physical directory and updates the items in ConfigManager.
-        Preserves custom metadata (custom_icon, args) across syncs,
-        supporting path changes and category renames via basename fallback.
+        Preserves custom metadata (subgroup, custom_icon, args, type, custom name),
+        virtual web bookmarks, and manual drag-and-drop item ordering across syncs.
         Emits storage_synced signal.
         """
         if not force and not self.is_folder_storage_mapped(folder_name):
             return []
 
+        target_f = next(
+            (f for f in self.config_manager.get_folders() if f.get("name", "").lower() == folder_name.lower()),
+            None,
+        )
+        was_already_mapped = bool(target_f and target_f.get("storage_mapped"))
+
+        self._pending_sync_folders = {
+            fn for fn in self._pending_sync_folders if fn.lower() != folder_name.lower()
+        }
         folder_dir = self.get_folder_storage_path(folder_name)
         if not os.path.exists(folder_dir):
-            items = []
+            scanned_items = []
         else:
             self._watch_directory(folder_dir)
-            items = scan_directory_items(folder_dir)
+            scanned_items = scan_directory_items(folder_dir)
 
-            # Auto-seed protection: If the physical directory exists but is empty,
-            # never wipe existing folder items to zero! Instead, auto-seed with existing items or system defaults!
-            if not items:
-                target_f = next((f for f in self.config_manager.get_folders() if f.get("name", "").lower() == folder_name.lower()), None)
-                existing_items = target_f.get("items", []) if target_f else []
-                if not existing_items and folder_name == "常用应用":
+            # Auto-seed protection on initial folder mapping: if a newly mapped directory is empty,
+            # seed from existing unmapped items (or defaults for 常用应用) instead of wiping to zero.
+            if not scanned_items and not was_already_mapped:
+                existing_seed = target_f.get("items", []) if target_f else []
+                if not existing_seed and folder_name == "常用应用":
                     try:
                         from config_manager import get_default_items
-                        existing_items = get_default_items()
+                        existing_seed = get_default_items()
                     except Exception:
-                        existing_items = []
+                        existing_seed = []
 
-                if existing_items:
-                    for it in existing_items:
+                if existing_seed:
+                    for it in existing_seed:
+                        if self._is_virtual_bookmark_item(it):
+                            continue
                         p = it.get("path")
                         if p and os.path.exists(p):
                             try:
@@ -743,40 +789,74 @@ class ManagedStorageEngine(QObject):
                                         create_shortcut_file(target_path=p, output_lnk_path=dst)
                             except Exception:
                                 pass
-                    items = scan_directory_items(folder_dir)
+                    scanned_items = scan_directory_items(folder_dir)
 
-        # Update config manager while preserving existing custom icons and args
+        merged_items = list(scanned_items)
         folders = self.config_manager.get_folders()
         for idx, f in enumerate(folders):
             if f.get("name", "").lower() == folder_name.lower():
-                old_items_map = {}
-                old_by_basename = {}
+                scanned_by_norm: Dict[str, int] = {}
+                scanned_by_base: Dict[str, List[int]] = {}
+                for s_idx, s_it in enumerate(scanned_items):
+                    p_norm = normalize_fs_path(s_it["path"])
+                    scanned_by_norm[p_norm] = s_idx
+                    b_norm = os.path.basename(p_norm)
+                    if b_norm:
+                        scanned_by_base.setdefault(b_norm, []).append(s_idx)
+
+                consumed_indices = set()
+                ordered_merged: List[Dict[str, Any]] = []
+
                 for old_it in f.get("items", []):
-                    if old_it.get("path"):
-                        p_norm = normalize_fs_path(old_it["path"])
-                        old_items_map[p_norm] = old_it
-                        b = os.path.basename(p_norm)
-                        if b:
-                            old_by_basename[b] = old_it
+                    if not isinstance(old_it, dict):
+                        continue
+                    if self._is_virtual_bookmark_item(old_it):
+                        ordered_merged.append(dict(old_it))
+                        continue
 
-                for it in items:
-                    p_key = normalize_fs_path(it["path"])
-                    b_key = os.path.basename(p_key)
-                    old_it = old_items_map.get(p_key) or old_by_basename.get(b_key)
-                    if old_it:
-                        if old_it.get("custom_icon"):
-                            it["custom_icon"] = old_it["custom_icon"]
-                        if old_it.get("args"):
-                            it["args"] = old_it["args"]
+                    old_path = old_it.get("path", "")
+                    if not old_path:
+                        continue
+                    old_norm = normalize_fs_path(old_path)
+                    matched_s_idx = None
+                    exact_path_match = False
 
+                    cand_idx = scanned_by_norm.get(old_norm)
+                    if cand_idx is not None and cand_idx not in consumed_indices:
+                        matched_s_idx = cand_idx
+                        exact_path_match = True
+                    elif not os.path.exists(old_path):
+                        b_old = os.path.basename(old_norm)
+                        for b_idx in scanned_by_base.get(b_old, []):
+                            if b_idx not in consumed_indices:
+                                matched_s_idx = b_idx
+                                break
+
+                    if matched_s_idx is not None:
+                        consumed_indices.add(matched_s_idx)
+                        new_it = dict(scanned_items[matched_s_idx])
+                        for meta_key in ("custom_icon", "args", "subgroup", "type"):
+                            if old_it.get(meta_key):
+                                new_it[meta_key] = old_it[meta_key]
+                        if exact_path_match and old_it.get("name"):
+                            new_it["name"] = old_it["name"]
+                        elif not exact_path_match and old_it.get("name"):
+                            new_it["name"] = old_it["name"]
+                        ordered_merged.append(new_it)
+
+                for s_idx, s_it in enumerate(scanned_items):
+                    if s_idx not in consumed_indices:
+                        ordered_merged.append(dict(s_it))
+
+                merged_items = ordered_merged
                 folders[idx]["name"] = folder_name
-                folders[idx]["items"] = items
+                folders[idx]["items"] = merged_items
                 folders[idx]["storage_mapped"] = True
                 self.config_manager.save()
                 break
 
-        self.storage_synced.emit(folder_name, items)
-        return items
+        self.storage_synced.emit(folder_name, merged_items)
+        return merged_items
 
     def rename_storage_item(self, item_path: str, new_name: str) -> Optional[str]:
         """
@@ -1002,13 +1082,15 @@ class ManagedStorageEngine(QObject):
                 continue
 
             src_abs = os.path.abspath(src)
-            # Avoid moving directory into itself or its own subdirectories
+            # Avoid moving directory into itself, its subdirectories, or sweeping Stacky self/container items
             if src_abs == target_abs or target_abs.startswith(src_abs + os.sep):
                 continue
             if os.path.dirname(src_abs) == target_abs:
                 continue
 
             base_name = os.path.basename(src_abs)
+            if base_name.lower() in _SELF_AND_CONTAINER_EXCLUDES:
+                continue
             name_part, ext_part = os.path.splitext(base_name)
             is_shortcut = ext_part.lower() in [".lnk", ".url"]
 
@@ -1194,6 +1276,9 @@ class ManagedStorageEngine(QObject):
         if not os.path.exists(desktop_dir):
             return 0
 
+        self._pending_sync_folders = {
+            fn for fn in self._pending_sync_folders if fn.lower() != folder_name.lower()
+        }
         folder_dir = self.get_folder_storage_path(folder_name)
         restored_count = 0
 
@@ -1316,26 +1401,25 @@ class ManagedStorageEngine(QObject):
         if not desktop_dirs:
             return {"moved_count": 0, "moved_files": [], "populated_categories": []}
 
-        # Items strictly excluded from tidying
+        # Items strictly excluded from tidying (system icons, Stacky self shortcuts, container folders)
         excluded_names = {
             "desktop.ini",
             "thumbs.db",
-            "仿手机大文件夹.lnk",
-            "仿手机大文件夹启动台.lnk",
-            "deskbox.lnk",
-            "stacky.lnk",
-            "stacky 灵叠.lnk",
-            "stacky 灵叠启动台.lnk",
+            ".ds_store",
             "recycle bin.lnk",
+            "回收站.lnk",
             "此电脑.lnk",
             "网络.lnk",
-            "控制面板.lnk"
-        }
+            "控制面板.lnk",
+            "deskbox.lnk",
+        } | set(_SELF_AND_CONTAINER_EXCLUDES)
         # Incomplete / temporary suffixes to skip
-        temp_suffixes = {".tmp", ".temp", ".part", ".partial", ".crdownload", ".download"}
+        temp_suffixes = {".tmp", ".temp", ".tmp_heal", ".part", ".partial", ".crdownload", ".download"}
 
         candidates = []
         root_abs = os.path.abspath(self.root_path)
+        norm_root_abs = normalize_fs_path(root_abs)
+        norm_legacy_root = normalize_fs_path(os.path.join(os.path.expanduser("~"), "DeskBox"))
 
         for d in desktop_dirs:
             try:
@@ -1344,17 +1428,30 @@ class ManagedStorageEngine(QObject):
                 continue
 
             for entry in entries:
-                if entry.lower() in excluded_names or entry.startswith("~") or entry.startswith("."):
+                entry_low = entry.lower()
+                if entry_low in excluded_names or entry.startswith("~") or entry.startswith("."):
                     continue
                 # Also skip backup dumps like policy-backup-*, org-policy-*, tmp*
-                if entry.lower().startswith(("policy-backup", "org-policy", "tmp")):
+                if entry_low.startswith(("policy-backup", "org-policy", "tmp")):
                     continue
                 _, ext = os.path.splitext(entry)
                 if ext.lower() in temp_suffixes:
                     continue
                 full_path = os.path.join(d, entry)
-                if os.path.abspath(full_path) == root_abs:
+                norm_full = normalize_fs_path(full_path)
+                if norm_full in (norm_root_abs, norm_legacy_root):
                     continue
+                if ext.lower() == ".lnk":
+                    sc_target = resolve_shortcut_target(full_path)
+                    if sc_target:
+                        sc_base = sc_target.split(" ")[0]
+                        norm_sc_base = normalize_fs_path(sc_base) if os.path.exists(sc_base) else sc_base
+                        if norm_sc_base in (norm_root_abs, norm_legacy_root):
+                            continue
+                        if ("--activate" in sc_target or "--toggle" in sc_target) and (
+                            "main.py" in sc_target or "bigfolderlauncher" in sc_target or "stacky" in sc_target
+                        ):
+                            continue
                 candidates.append(full_path)
 
         # Deduplicate candidates across user desktop and public desktop
@@ -1459,20 +1556,23 @@ class ManagedStorageEngine(QObject):
                         else:
                             seen_targets[t] = f_path
 
-        # Step 2: Restore 'Stacky 灵叠.lnk' back to Desktop from any category if swept in
-        desktop_p = os.path.expandvars(r"%USERPROFILE%\Desktop\Stacky 灵叠.lnk")
+        # Step 2: Restore self-launcher shortcuts back to Desktop from any category if swept in
+        desk_dir = get_desktop_dir()
         for cat_dir_name in os.listdir(root_dir):
             c_p = os.path.join(root_dir, cat_dir_name)
             if os.path.isdir(c_p):
-                stacky_lnk = os.path.join(c_p, "Stacky 灵叠.lnk")
-                if os.path.exists(stacky_lnk):
-                    try:
-                        if not os.path.exists(desktop_p):
-                            shutil.move(stacky_lnk, desktop_p)
-                        else:
-                            os.remove(stacky_lnk)
-                    except Exception:
-                        pass
+                for self_lnk_name in ("Stacky 灵叠.lnk", "仿手机大文件夹.lnk", "仿手机大文件夹启动台.lnk", "DeskBox Files.lnk"):
+                    swept_lnk = os.path.join(c_p, self_lnk_name)
+                    if os.path.exists(swept_lnk):
+                        try:
+                            if self_lnk_name == "Stacky 灵叠.lnk" and desk_dir and os.path.exists(desk_dir):
+                                desktop_p = os.path.join(desk_dir, "Stacky 灵叠.lnk")
+                                if not os.path.exists(desktop_p):
+                                    shutil.move(swept_lnk, desktop_p)
+                                    continue
+                            os.remove(swept_lnk)
+                        except Exception:
+                            pass
 
         # Step 3: Thoroughly scan ALL categories and redistribute misplaced items into proper thematic categories
         all_categories = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
@@ -1516,3 +1616,7 @@ class ManagedStorageEngine(QObject):
             "redistributed_count": redistributed_count,
             "populated_categories": list(populated_cats)
         }
+
+
+sys.modules.setdefault("storage_manager", sys.modules[__name__])
+sys.modules.setdefault("stacky.core.storage_manager", sys.modules[__name__])

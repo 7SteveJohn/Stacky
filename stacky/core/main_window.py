@@ -6,9 +6,9 @@ import ctypes
 from ctypes import wintypes
 from typing import Dict, Any, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QPoint, QRect, QRectF, QSize, QTimer, Signal, QEvent, QVariantAnimation, QEasingCurve
+from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QTimer, Signal, QEvent, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import (
-    QPainter, QColor, QFont, QFontMetrics, QPen, QCursor, QAction, QActionGroup, QIcon
+    QPainter, QPainterPath, QColor, QFont, QFontMetrics, QPen, QCursor, QAction, QActionGroup, QIcon, QPixmap
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QGridLayout, QLabel, QMenu,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import ConfigManager
+import ui_kit
 from ui_kit import theme_pick
 from acrylic_utils import apply_blur, remove_blur
 from widgets import BigFolderCard, FolderTitleLabel, AppSlotWidget
@@ -57,13 +58,35 @@ VK_SPACE = 0x20
 VK_F = 0x46
 
 
+def _toast_font() -> QFont:
+    font = QFont()
+    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI"])
+    font.setPixelSize(12)
+    font.setWeight(QFont.Weight.Medium)
+    font.setStyleStrategy(
+        QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality
+    )
+    return font
+
+
 class ToastWidget(QWidget):
-    """Subtle floating notification HUD on card with smooth fade-in/fade-out animation using pure QPainter"""
+    """Subtle non-blocking capsule pill HUD near card top inner margin."""
+
+    _PILL_HEIGHT = 30
+    _LEFT_PAD = 12
+    _DOT_SIZE = 6
+    _DOT_GAP = 7
+    _RIGHT_PAD = 13
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if parent is None:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFont(self._toast_font())
         self.current_opacity: float = 0.0
         self.message_text: str = ""
+        self._elided_text: str = ""
         self.is_error: bool = False
 
         self.anim = QVariantAnimation(self)
@@ -74,6 +97,10 @@ class ToastWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self._start_fade_out)
+
+    @staticmethod
+    def _toast_font() -> QFont:
+        return _toast_font()
 
     def _on_opacity_tick(self, val):
         self.current_opacity = float(val)
@@ -91,33 +118,56 @@ class ToastWidget(QWidget):
         self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.anim.start()
 
-    def show_message(self, message: str, is_error: bool = False, duration_ms: int = 2400):
-        self.message_text = message
-        self.is_error = is_error
-
-        font = QFont("Segoe UI Variable Display", 10)
+    def _layout_pill(self):
+        font = self._toast_font()
+        self.setFont(font)
         fm = QFontMetrics(font)
-        text_w = fm.horizontalAdvance(message)
-        text_h = fm.height()
-        w = text_w + 32
-        h = max(28, text_h + 12)
+
+        h = self._PILL_HEIGHT
+        chrome_w = self._LEFT_PAD + self._DOT_SIZE + self._DOT_GAP + self._RIGHT_PAD
+
+        parent = self.parentWidget()
+        if parent is not None and parent.rect().width() > 32:
+            parent_rect = parent.rect()
+            max_w = max(chrome_w + 24, parent_rect.width() - 16)
+        else:
+            parent_rect = None
+            max_w = 320
+
+        avail_text_w = max(24, max_w - chrome_w)
+        self._elided_text = fm.elidedText(
+            self.message_text, Qt.TextElideMode.ElideRight, avail_text_w
+        )
+        text_w = fm.horizontalAdvance(self._elided_text)
+        w = min(max_w, max(chrome_w + 16, text_w + chrome_w))
         self.resize(w, h)
 
-        if self.parent():
-            parent_rect = self.parent().rect()
-            x = (parent_rect.width() - self.width()) // 2
-            y = (parent_rect.height() - self.height()) // 2
+        if parent_rect is not None:
+            if parent_rect.width() >= w + 16:
+                x = max(8, min((parent_rect.width() - w) // 2, parent_rect.width() - w - 8))
+            else:
+                x = max(0, (parent_rect.width() - w) // 2)
+            max_y = max(0, parent_rect.height() - h - 6)
+            y = max(0, min(10, max_y))
             self.move(x, y)
+
+    def show_message(self, message: str, is_error: bool = False, duration_ms: int = 2200):
+        if not message:
+            self.timer.stop()
+            self.anim.stop()
+            self.current_opacity = 0.0
+            self.hide()
+            return
+
+        self.message_text = message
+        self.is_error = is_error
+        self._layout_pill()
+
+        self.anim.stop()
+        self.current_opacity = 1.0
         self.show()
         self.raise_()
-
-        # Smooth fade-in
-        self.anim.stop()
-        self.anim.setStartValue(self.current_opacity)
-        self.anim.setEndValue(1.0)
-        self.anim.setDuration(160)
-        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self.anim.start()
+        self.update()
 
         self.timer.start(duration_ms)
 
@@ -125,29 +175,129 @@ class ToastWidget(QWidget):
         if self.current_opacity <= 0.01:
             return
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        op = max(0.0, min(1.0, float(self.current_opacity)))
+        theme = getattr(self.parent(), "theme", "dark") if self.parent() is not None else "dark"
+
+        if theme == "light":
+            bg_color = QColor(255, 255, 255, int(244 * op))
+            border_color = QColor(15, 23, 42, int(28 * op))
+            text_color = QColor(15, 23, 42, int(245 * op))
+        else:
+            bg_color = QColor(20, 23, 31, int(242 * op))
+            border_color = QColor(255, 255, 255, int(38 * op))
+            text_color = QColor(244, 246, 250, int(252 * op))
 
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        path = create_squircle_path(rect, 12)
-
-        op = self.current_opacity
-        if self.is_error:
-            bg_color = QColor(75, 22, 28, int(245 * op))
-            border_color = QColor(255, 100, 100, int(75 * op))
-            text_color = QColor(255, 160, 160, int(255 * op))
-        else:
-            bg_color = QColor(22, 24, 32, int(242 * op))
-            border_color = QColor(255, 255, 255, int(45 * op))
-            text_color = QColor(245, 245, 247, int(255 * op))
+        radius = self.height() / 2.0
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
 
         p.fillPath(path, bg_color)
         p.strokePath(path, QPen(border_color, 1.0))
 
-        font = QFont("Segoe UI Variable Display", 10)
+        dot_color = QColor("#ef4444") if self.is_error else QColor("#3b82f6")
+        dot_color.setAlpha(int(255 * op))
+        dot_x = float(self._LEFT_PAD)
+        dot_y = (float(self.height()) - float(self._DOT_SIZE)) / 2.0
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(dot_color)
+        p.drawEllipse(QRectF(dot_x, dot_y, float(self._DOT_SIZE), float(self._DOT_SIZE)))
+
+        font = self._toast_font()
         p.setFont(font)
         p.setPen(text_color)
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.message_text)
+        text_x = float(self._LEFT_PAD + self._DOT_SIZE + self._DOT_GAP)
+        text_w = max(0.0, float(self.width()) - text_x - float(self._RIGHT_PAD))
+        text_rect = QRectF(text_x, 0.0, text_w, float(self.height()))
+        p.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            self._elided_text or self.message_text,
+        )
+        p.end()
+
+
+class _PageTurnOverlay(QWidget):
+    """Lightweight 150ms OutCubic cross-fade + ±12px horizontal slide micro-transition overlay."""
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        if parent is None:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._old_pm: Optional[QPixmap] = None
+        self._direction: int = 1
+        self._progress: float = 0.0
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(150)
+        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.anim.valueChanged.connect(self._on_tick)
+        self.anim.finished.connect(self._on_finished)
+        self.hide()
+
+    def start_transition(self, old_pm: QPixmap, direction: int):
+        if old_pm is None or old_pm.isNull() or self.parentWidget() is None:
+            self.stop_and_hide()
+            return
+        self.anim.stop()
+        self._old_pm = old_pm
+        self._direction = 1 if direction >= 0 else -1
+        self._progress = 0.0
+        self.setGeometry(self.parentWidget().rect())
+        self.show()
+        self.raise_()
+        self.anim.setStartValue(0.0)
+        self.anim.setEndValue(1.0)
+        self.anim.setDuration(150)
+        self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.anim.start()
+
+    def stop_and_hide(self):
+        self.anim.stop()
+        self._old_pm = None
+        self.hide()
+
+    def _on_tick(self, val):
+        self._progress = float(val)
+        if self._progress >= 0.995:
+            self.stop_and_hide()
+            return
+        self.update()
+
+    def _on_finished(self):
+        self._old_pm = None
+        self.hide()
+
+    def paintEvent(self, event):
+        if self._old_pm is None or self._old_pm.isNull():
+            return
+        alpha = max(0.0, min(1.0, 1.0 - self._progress))
+        if alpha <= 0.01:
+            return
+        pm_logical = self._old_pm.deviceIndependentSize()
+        pm_w = float(pm_logical.width())
+        pm_h = float(pm_logical.height())
+        if pm_w <= 1.0 or pm_h <= 1.0:
+            return
+        w, h = float(self.width()), float(self.height())
+        if abs(w - pm_w) > 2.0 or abs(h - pm_h) > 2.0:
+            self.stop_and_hide()
+            return
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            parent = self.parentWidget()
+            radius = float(getattr(parent, "radius", 26))
+            if w > 2.0 and h > 2.0:
+                p.setClipPath(create_squircle_path(QRectF(1.0, 1.0, w - 2.0, h - 2.0), radius))
+            dx = -12.0 * self._direction * self._progress
+            p.setOpacity(alpha)
+            p.drawPixmap(QRectF(dx, 0.0, pm_w, pm_h), self._old_pm, QRectF(self._old_pm.rect()))
+        finally:
+            p.end()
 
 
 class BigFolderWindow(QWidget):
@@ -295,6 +445,7 @@ class BigFolderWindow(QWidget):
         radius = layout_scale.to_screen(self.config_manager.get("border_radius", 26), s)
         opacity = self.config_manager.get("opacity", 0.88)
         theme = self.config_manager.get("theme", "dark")
+        self.theme = theme
 
         # 1. Big Folder Card (1:1 Pure Square Mobile Squircle)
         self.card = BigFolderCard(radius=radius, opacity=opacity, theme=theme, parent=self)
@@ -312,7 +463,7 @@ class BigFolderWindow(QWidget):
         title_text = self.get_display_title_text()
         self.title_label = FolderTitleLabel(title_text, parent=self)
         self.title_label.set_layout_scale(s)
-        self.title_label.setToolTip("点击展开全景大文件夹 · 右键切换分类")
+        self.title_label.setToolTip("点击展开 · 右键切换分类")
         self.title_label.request_click.connect(self.open_expanded_drawer)
         self.title_label.request_open_drawer.connect(self.open_expanded_drawer)
         self.title_label.request_menu.connect(self.show_folder_switch_menu)
@@ -411,6 +562,9 @@ class BigFolderWindow(QWidget):
     def get_display_title_text(self) -> str:
         state = self.get_layout_state()
         name = self.get_current_folder_name()
+        card = getattr(self, "card", None)
+        if card is not None and hasattr(card, "set_pagination"):
+            return name
         pages, page = state["pages"], state["page"]
         if pages > 1:
             # 页数多时圆点会拉成长串压住图标名，超过 5 页改用 1/8 计数
@@ -463,6 +617,7 @@ class BigFolderWindow(QWidget):
         icon_size = max(max(10, layout_scale.to_screen(16, s)),
                         int(base_icon * slot_size / max(1, base_slot)))
         theme = self.config_manager.get("theme", "dark")
+        self.theme = theme
 
         # 格子间距恒为 9px；多余空间放到四周内边距，避免图标被拉开
         for r_idx in range(6):
@@ -472,7 +627,11 @@ class BigFolderWindow(QWidget):
 
         items = state["items"]
         self.active_page = state["page"]      # 越界页在这里统一收回
+        if hasattr(self.card, "set_pagination"):
+            self.card.set_pagination(state["page"], state["pages"])
         self.title_label.set_text(self.get_display_title_text())
+        if getattr(self, "manager", None) is not None and hasattr(self.manager, "_sync_glass_if_changed"):
+            self.manager._sync_glass_if_changed()
 
         # Authentic Mobile 8+1 Overflow Cluster Pattern:
         # If items > 9 in a 3x3 layout and on page 0, slot 9 becomes a 4-in-1 mini cluster preview!
@@ -503,7 +662,9 @@ class BigFolderWindow(QWidget):
                     show_running_badge=show_running_b,
                     parent=self.card
                 )
+                slot._settings_signal_wired = True
                 slot.request_open_drawer.connect(self.open_expanded_drawer)
+                slot.request_open_settings.connect(lambda: self.action_open_settings(0))
                 slot.request_global_menu.connect(self.show_global_menu)
                 slot.status_toast.connect(self.toast.show_message)
             else:
@@ -522,12 +683,14 @@ class BigFolderWindow(QWidget):
                     show_running_badge=show_running_b,
                     parent=self.card
                 )
+                slot._settings_signal_wired = True
                 slot.item_changed.connect(self.on_slot_item_changed)
                 slot.item_removed.connect(self.on_slot_item_removed)
                 slot.item_moved.connect(self.on_slot_item_moved)
                 slot.request_add.connect(self.on_request_add)
                 slot.request_add_web.connect(self.on_request_add_web)
                 slot.request_open_drawer.connect(self.open_expanded_drawer)
+                slot.request_open_settings.connect(lambda: self.action_open_settings(0))
                 slot.request_global_menu.connect(self.show_global_menu)
                 slot.request_move_to_desktop.connect(self.on_request_move_to_desktop)
                 slot.request_recycle.connect(self.on_request_recycle)
@@ -535,18 +698,25 @@ class BigFolderWindow(QWidget):
                 slot.item_launched.connect(self.on_slot_app_launched)
 
             self.card_layout.addWidget(slot, r, c)
+            if self.card.isVisible():
+                slot.show()
             self.slot_widgets.append(slot)
 
         if not items:
-            # 空分类不能只是一块空玻璃：给一句占位说明，避免用户以为是渲染坏了
-            hint = QLabel("空分类\n把应用拖进来，或右键「整理图标」", self.card)
+            # 空分类给一句轻量占位说明，避免用户误以为是空白异常
+            hint = QLabel("暂无应用\n拖入快捷方式即可添加", self.card)
+            hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hint.setWordWrap(True)
             hint_color = theme_pick(self.config_manager.get("theme", "dark"),
-                                   "rgba(15,23,42,0.62)", "rgba(255,255,255,0.45)")
+                                   "rgba(15,23,42,0.58)", "rgba(255,255,255,0.45)")
             hint.setStyleSheet(
-                f"color: {hint_color}; font-size: 12px; background: transparent;")
+                'font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI"; '
+                f"color: {hint_color}; font-size: 12px; background: transparent;"
+            )
             self.card_layout.addWidget(hint, 0, 0, max(1, rows), max(1, cols))
+            if self.card.isVisible():
+                hint.show()
             self._empty_hint = hint
 
         if saved_size:
@@ -560,7 +730,15 @@ class BigFolderWindow(QWidget):
         extra_w, extra_h = max(0, card_w - used_w), max(0, card_h - used_h)
         ml, mt = extra_w // 2, extra_h // 2
         self.card_layout.setContentsMargins(ml, mt, extra_w - ml, extra_h - mt)
+        overlay = getattr(self, "_page_turn_overlay", None)
+        if overlay is not None and self.card.size() != QSize(card_w, card_h):
+            overlay.stop_and_hide()
         self.card.setFixedSize(card_w, card_h)
+        self.card_layout.activate()
+        if hasattr(self, "toast") and self.toast is not None:
+            if self.toast.isVisible():
+                self.toast._layout_pill()
+            self.toast.raise_()
 
         self.adjustSize()
 
@@ -580,19 +758,46 @@ class BigFolderWindow(QWidget):
         page_count = state["pages"]
         self.active_page = state["page"]
 
-        if page_count > 1:
-            if delta < 0 and self.active_page < page_count - 1:
-                self.active_page += 1
-                self._schedule_rebuild()
-                return
-            elif delta > 0 and self.active_page > 0:
-                self.active_page -= 1
-                self._schedule_rebuild()
-                return
+        if page_count <= 1:
+            return
+
+        direction = 0
+        if delta < 0 and self.active_page < page_count - 1:
+            direction = 1
+        elif delta > 0 and self.active_page > 0:
+            direction = -1
+        else:
+            return
+
+        overlay = getattr(self, "_page_turn_overlay", None)
+        if overlay is not None:
+            overlay.stop_and_hide()
+
+        old_pm = None
+        if hasattr(self, "card") and self.card is not None and self.card.isVisible():
+            try:
+                old_pm = self.card.grab()
+            except Exception:
+                old_pm = None
+
+        self.active_page += direction
+        self._rebuild_scheduled = False
+        self.rebuild_grid()
+
+        if old_pm is not None and not old_pm.isNull() and self.card.isVisible():
+            if overlay is None:
+                overlay = _PageTurnOverlay(self.card)
+                self._page_turn_overlay = overlay
+            overlay.start_transition(old_pm, direction)
+            if hasattr(self, "toast") and self.toast.isVisible():
+                self.toast.raise_()
 
     def switch_folder(self, folder_index: int):
         folders = self.config_manager.get_folders()
         if 0 <= folder_index < len(folders):
+            overlay = getattr(self, "_page_turn_overlay", None)
+            if overlay is not None:
+                overlay.stop_and_hide()
             new_name = folders[folder_index].get("name", "常用应用")
             self.bound_folder_name = new_name
             if hasattr(self, "instance_id") and self.instance_id:
@@ -603,35 +808,41 @@ class BigFolderWindow(QWidget):
             if hasattr(self, "storage_engine") and self.config_manager.is_managed_storage_enabled():
                 self.storage_engine.sync_folder_from_storage(new_name)
             self.rebuild_grid()
-            self.toast.show_message(f"已切换至: {new_name}")
+            self.toast.show_message(f"已切换至 {new_name}")
 
     def show_folder_switch_menu(self, global_pos: QPoint):
         """Popup category pills menu when clicking the title label"""
+        self._reset_mouse_press_state()
         menu = QMenu(self)
-        menu.setStyleSheet("""
-        QMenu {
-            background-color: rgba(26, 28, 36, 250);
-            color: #f5f5f5;
-            border: 1px solid rgba(255, 255, 255, 45);
-            border-radius: 12px;
-            padding: 6px;
-            font-family: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei";
-            font-size: 13px;
-        }
-        QMenu::item {
-            padding: 6px 20px;
-            border-radius: 6px;
-        }
-        QMenu::item:selected {
-            background-color: rgba(255, 255, 255, 45);
-            color: #ffffff;
-        }
-        QMenu::separator {
-            height: 1px;
-            background-color: rgba(255, 255, 255, 25);
-            margin: 4px 6px;
-        }
-        """)
+        theme = self.config_manager.get("theme", "dark")
+        _menu_qss = getattr(ui_kit, "menu_qss", None)
+        if callable(_menu_qss):
+            menu.setStyleSheet(_menu_qss(theme))
+        else:
+            menu.setStyleSheet("""
+            QMenu {
+                background-color: rgba(26, 28, 36, 250);
+                color: #f5f5f5;
+                border: 1px solid rgba(255, 255, 255, 45);
+                border-radius: 12px;
+                padding: 6px;
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 6px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(255, 255, 255, 45);
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: rgba(255, 255, 255, 25);
+                margin: 4px 6px;
+            }
+            """)
 
         folders = self.config_manager.get_folders()
         curr_idx = self.get_current_folder_index()
@@ -671,7 +882,7 @@ class BigFolderWindow(QWidget):
         menu.exec(global_pos)
 
     def action_add_folder(self):
-        new_name, ok = QInputDialog.getText(self, "新建分类", "请输入新文件夹分类名称:")
+        new_name, ok = QInputDialog.getText(self, "新建分类", "请输入分类名称：")
         if ok and new_name.strip():
             new_idx = self.config_manager.add_folder(new_name.strip())
             self.switch_folder(new_idx)
@@ -681,8 +892,8 @@ class BigFolderWindow(QWidget):
         name = self.get_current_folder_name()
         reply = QMessageBox.question(
             self,
-            "解散文件夹确认",
-            f"确定要解散大文件夹【{name}】吗？\n\n文件夹内的所有应用与快捷方式将原封不动放回桌面。",
+            "解散分类",
+            f"确定要解散「{name}」吗？\n\n分类内的应用与快捷方式将放回桌面。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
@@ -704,11 +915,11 @@ class BigFolderWindow(QWidget):
                             w.bound_folder_name = fallback_name
                             w.active_page = 0
                             w.rebuild_grid()
-                msg = f"已解散【{name}】，{restored_count} 个应用已放回桌面" if restored_count > 0 else f"已解散文件夹: {name}"
-                self.toast.show_message(msg, duration_ms=3500)
+                msg = f"已解散「{name}」，{restored_count} 项已放回桌面" if restored_count > 0 else f"已解散「{name}」"
+                self.toast.show_message(msg, duration_ms=3000)
 
-    def bring_to_front_and_toast(self, message: str = "仿手机大文件夹已就绪！"):
-        """Ensures the window or launcher drawer is visible and prompts the user"""
+    def bring_to_front_and_toast(self, message: str = ""):
+        """Ensures the window or launcher drawer is visible and optionally shows a toast."""
         launcher_mode = self.config_manager.get("launcher_mode", "hybrid")
         self.show()
         if launcher_mode == "summon":
@@ -717,7 +928,8 @@ class BigFolderWindow(QWidget):
             self.activateWindow()
         else:
             self.apply_layer_mode()
-            self.toast.show_message(message)
+            if message:
+                self.toast.show_message(message)
 
     def is_drawer_open(self) -> bool:
         if self.current_drawer is None:
@@ -750,10 +962,6 @@ class BigFolderWindow(QWidget):
             self.current_drawer = None
             try:
                 d.closed.disconnect(self.on_drawer_closed)
-            except Exception:
-                pass
-            try:
-                d.destroyed.disconnect(self.on_drawer_closed)
             except Exception:
                 pass
             if immediately:
@@ -802,7 +1010,6 @@ class BigFolderWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
-        self.toast.show_message("仿手机大文件夹已就绪", duration_ms=1600)
 
     def dismiss_summon_card(self):
         """
@@ -893,6 +1100,9 @@ class BigFolderWindow(QWidget):
             return
 
         # 展开时标题会透过半透明抽屉形成重影；关闭时 on_drawer_closed 会恢复
+        overlay = getattr(self, "_page_turn_overlay", None)
+        if overlay is not None:
+            overlay.stop_and_hide()
         self.title_label.hide()
 
         folder = self.get_current_folder()
@@ -1040,7 +1250,7 @@ class BigFolderWindow(QWidget):
                     w.bound_folder_name = new_name
                     w.title_label.set_text(w.get_display_title_text())
                     w.rebuild_grid()
-            self.toast.show_message(f"已重命名为: {new_name}")
+            self.toast.show_message(f"已重命名为 {new_name}")
 
     def on_drawer_item_changed(self, index: int, updated_item: dict):
         folder = self.get_current_folder()
@@ -1189,8 +1399,9 @@ class BigFolderWindow(QWidget):
 
             # Repaint sync on WM_PAINT (0x000F) or WM_ERASEBKGND (0x0014)
             if msg.message in (0x000F, 0x0014):
-                if hasattr(self, "card") and self.card.isVisible():
-                    self.card.update()
+                if hasattr(self, "card") and self.card.isVisible() and not getattr(self, "_paint_sync_queued", False):
+                    self._paint_sync_queued = True
+                    QTimer.singleShot(0, self._flush_paint_sync)
 
             # 1. Non-client hit test: transparent margin padding passes through to Windows Desktop
             if msg.message == 0x0084:  # WM_NCHITTEST
@@ -1233,6 +1444,11 @@ class BigFolderWindow(QWidget):
         except Exception:
             pass
         return super().nativeEvent(event_type, message)
+
+    def _flush_paint_sync(self):
+        self._paint_sync_queued = False
+        if hasattr(self, "card") and self.card is not None and self.card.isVisible():
+            self.card.update()
 
     def is_locked(self) -> bool:
         if hasattr(self, "instance_id") and self.instance_id:
@@ -1281,8 +1497,10 @@ class BigFolderWindow(QWidget):
         card_offset = self.card.pos()
         my_card_rect = QRect(self.pos() + card_offset, self.card.size())
 
-        screen = self.screen() or QApplication.primaryScreen()
-        avail_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        avail_geo = layout_scale.screen_available_geometry_for_widget(self)
+        if avail_geo is None:
+            screen = self.screen() or QApplication.primaryScreen()
+            avail_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
         safe_right = avail_geo.x() + avail_geo.width() - 8
         safe_left = avail_geo.x() + 8
         safe_bottom = avail_geo.y() + avail_geo.height() - 8
@@ -1356,6 +1574,8 @@ class BigFolderWindow(QWidget):
                     mgr._on_memo_pos_changed(win.x(), win.y())
                 elif w_type == "media":
                     mgr._on_media_pos_changed(win.x(), win.y())
+                elif w_type == "everything":
+                    mgr._on_everything_pos_changed(win.x(), win.y())
 
         # 触发全局防重叠联动校验
         mgr.validate_and_separate_all_desktop_cards(from_user=True)
@@ -1382,14 +1602,26 @@ class BigFolderWindow(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # 0. 防御按键释放丢失 (如拖拽中 Alt+Tab / Win+D / 弹窗抢占焦点)，立即清理残留白框与拖拽锁
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            if getattr(self, "is_left_pressed", False) or getattr(self, "_is_resizing_card", False) or getattr(self, "is_moving_window", False):
+                self.is_left_pressed = False
+                self._is_resizing_card = False
+                self.is_moving_window = False
+                self._pending_snap_pos = None
+                self._pending_card_pos = None
+                self._hide_drag_preview()
+
         # 1. 无极缩放拖拽中 (带屏幕防出界钳位与相邻卡片/微件尺寸物理磁吸)
         if getattr(self, "_is_resizing_card", False) and (event.buttons() & Qt.MouseButton.LeftButton):
             delta = event.globalPosition().toPoint() - self._resize_start_global
             raw_w = self._resize_start_card_size.width() + delta.x()
             raw_h = self._resize_start_card_size.height() + delta.y()
 
-            screen = self.screen() or QApplication.primaryScreen()
-            avail_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+            avail_geo = layout_scale.screen_available_geometry_for_widget(self)
+            if avail_geo is None:
+                screen = self.screen() or QApplication.primaryScreen()
+                avail_geo = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
             card_global_pos = self.pos() + self.card.pos()
             extra_h = 36 if hasattr(self, "title_label") and self.title_label and self.title_label.isVisible() else 0
             # 最小尺寸由槽位下限推导，不再硬编码 160
@@ -1558,39 +1790,106 @@ class BigFolderWindow(QWidget):
             self.title_label.setVisible(False)
         super().leaveEvent(event)
 
+    def _reset_mouse_press_state(self):
+        self.is_left_pressed = False
+        self._is_resizing_card = False
+        self.is_moving_window = False
+        self._pending_snap_pos = None
+        self._pending_card_pos = None
+        self._hide_drag_preview()
+
     def contextMenuEvent(self, event):
+        self._reset_mouse_press_state()
         self.show_global_menu(event.globalPos())
+        event.accept()
 
     def show_global_menu(self, global_pos: QPoint):
+        self._reset_mouse_press_state()
         menu = self.create_global_menu()
         menu.exec(global_pos)
 
-    def create_global_menu(self) -> QMenu:
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-        QMenu {
-            background-color: rgba(24, 26, 32, 248);
-            color: #f5f5f5;
-            border: 1px solid rgba(255, 255, 255, 40);
-            border-radius: 14px;
-            padding: 8px;
-            font-family: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei";
-            font-size: 13px;
-        }
-        QMenu::item {
-            padding: 7px 24px 7px 14px;
-            border-radius: 7px;
-        }
-        QMenu::item:selected {
-            background-color: rgba(255, 255, 255, 48);
-            color: #ffffff;
-        }
-        QMenu::separator {
-            height: 1px;
-            background-color: rgba(255, 255, 255, 25);
-            margin: 5px 6px;
-        }
-        """)
+    def populate_card_manage_submenu(self, target_menu: QMenu):
+        act_drawer = target_menu.addAction("展开")
+        act_drawer.triggered.connect(lambda: self.open_expanded_drawer(show_search=True))
+
+        cat_menu = target_menu.addMenu("切换分类")
+        cat_menu.setStyleSheet(target_menu.styleSheet())
+        folders = self.config_manager.get_folders()
+        curr_f_idx = self.get_current_folder_index()
+        for idx, f in enumerate(folders):
+            name = f.get("name", "未命名分类")
+            prefix = "● " if idx == curr_f_idx else "○ "
+            act = cat_menu.addAction(f"{prefix}{name}")
+            act.triggered.connect(lambda checked=False, i=idx: self.switch_folder(i))
+        cat_menu.addSeparator()
+        act_new_cat = cat_menu.addAction("新建分类")
+        act_new_cat.triggered.connect(self.action_add_folder)
+
+        shape_menu = target_menu.addMenu("网格")
+        shape_menu.setStyleSheet(target_menu.styleSheet())
+        presets = [
+            ("2 × 2", 2, 2),
+            ("2 × 4", 2, 4),
+            ("3 × 3", 3, 3),
+            ("4 × 2", 4, 2),
+            ("4 × 4", 4, 4),
+        ]
+        cur_r, cur_c = self.get_grid_dimensions()
+        for label, r, c in presets:
+            prefix = "● " if (cur_r == r and cur_c == c) else "○ "
+            act = shape_menu.addAction(f"{prefix}{label}")
+            act.triggered.connect(lambda checked=False, row=r, col=c: self.apply_grid_shape(row, col))
+
+        act_align = target_menu.addAction("对齐")
+        act_align.triggered.connect(self.align_to_adjacent_widget)
+
+        is_cur_locked = self.is_locked()
+        act_lock = target_menu.addAction("解锁" if is_cur_locked else "锁定")
+        act_lock.triggered.connect(self.toggle_lock_position)
+
+        target_menu.addSeparator()
+        act_close_this = target_menu.addAction("关闭此卡片")
+        act_close_this.triggered.connect(self.action_close_this_instance)
+
+        if len(folders) > 1:
+            act_dissolve = target_menu.addAction("解散")
+            act_dissolve.triggered.connect(self.action_delete_folder)
+
+    def create_global_menu(
+        self,
+        parent: Optional[QWidget] = None,
+        settings_callback: Optional[Any] = None,
+    ) -> QMenu:
+        menu = QMenu(parent or self)
+        theme = self.config_manager.get("theme", "dark")
+        _menu_qss = getattr(ui_kit, "menu_qss", None)
+        if callable(_menu_qss):
+            menu.setStyleSheet(_menu_qss(theme))
+        else:
+            menu.setStyleSheet("""
+            QMenu {
+                background-color: rgba(24, 26, 32, 248);
+                color: #f5f5f5;
+                border: 1px solid rgba(255, 255, 255, 40);
+                border-radius: 14px;
+                padding: 8px;
+                font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI";
+                font-size: 13px;
+            }
+            QMenu::item {
+                padding: 7px 24px 7px 14px;
+                border-radius: 7px;
+            }
+            QMenu::item:selected {
+                background-color: rgba(255, 255, 255, 48);
+                color: #ffffff;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: rgba(255, 255, 255, 25);
+                margin: 5px 6px;
+            }
+            """)
 
         # 1. 核心高频动作
         act_drawer = menu.addAction("展开")
@@ -1638,7 +1937,10 @@ class BigFolderWindow(QWidget):
 
         # 5. 全局 Stacky 灵叠设置中心 (一站式配置，消除杂乱)
         act_settings = menu.addAction("设置")
-        act_settings.triggered.connect(lambda: self.action_open_settings(0))
+        if callable(settings_callback):
+            act_settings.triggered.connect(settings_callback)
+        else:
+            act_settings.triggered.connect(lambda: self.action_open_settings(0))
 
         menu.addSeparator()
 
@@ -1656,13 +1958,14 @@ class BigFolderWindow(QWidget):
         return menu
 
     def action_open_settings(self, tab_index: int = 0):
+        self._reset_mouse_press_state()
         try:
             if self.is_drawer_open():
                 self.close_expanded_drawer(immediately=True)
             from settings_dialog import SettingsDialog
             mgr = self.manager if hasattr(self, "manager") and self.manager else None
-            dlg = SettingsDialog(self.config_manager, window_manager=mgr, initial_tab=tab_index, parent=self)
-            dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+            # 严禁将顶级设置窗口挂为桌面底层透明窗口的子窗口 (避免 Qt6 enforceNativeChildren 把卡片升级为原生子 HWND)
+            dlg = SettingsDialog(self.config_manager, window_manager=mgr, initial_tab=tab_index, parent=None)
             dlg.exec()
         except Exception as e:
             print("Failed to open settings dialog:", e)
@@ -1686,7 +1989,7 @@ class BigFolderWindow(QWidget):
             desktop_dir=desktop_dir,
             create_desktop=create_desktop
         )
-        self.toast.show_message("已生成/刷新 Dock 专属快捷方式 (带高清图标)，可直接拖入 Dock！", duration_ms=3500)
+        self.toast.show_message("已更新快捷方式，可拖入 Dock 使用", duration_ms=2600)
         return lnk
 
 
@@ -1697,17 +2000,17 @@ class BigFolderWindow(QWidget):
         if self.current_drawer and not self.current_drawer.is_closing:
             self.current_drawer.apply_open_app_mode(mode)
         desc = {
-            "double": "已切换为【全双击打开】(防误触 · 适合鼠标桌面)",
-            "hybrid": "已切换为【双层模式】(外层卡片单击 · 展开抽屉双击)",
-            "single": "已切换为【全单击打开】(极速仿手机 · 适合触屏)"
-        }.get(mode, "应用打开方式已更新")
+            "double": "打开方式：双击打开",
+            "hybrid": "打开方式：卡片单击 · 抽屉双击",
+            "single": "打开方式：单击打开",
+        }.get(mode, "打开方式已更新")
         self.toast.show_message(desc)
 
     def action_rename_folder(self):
         curr_folder = self.get_current_folder()
         curr_name = self.get_current_folder_name()
         new_name, ok = QInputDialog.getText(
-            self, "修改分类名称", "请输入文件夹分类名称:", text=curr_name
+            self, "重命名分类", "请输入分类名称：", text=curr_name
         )
         if ok and new_name.strip() and new_name.strip() != curr_name:
             curr_idx = self.get_current_folder_index()
@@ -1723,15 +2026,15 @@ class BigFolderWindow(QWidget):
                     w.bound_folder_name = target_name
                     w.title_label.set_text(w.get_display_title_text())
                     w.rebuild_grid()
-            self.toast.show_message(f"已重命名为: {target_name}")
+            self.toast.show_message(f"已重命名为 {target_name}")
 
 
     def set_layer_mode(self, mode: str):
         self.config_manager.set("layer_mode", mode)
         for w in list(BigFolderWindow._instances):
             w.apply_layer_mode()
-        labels = {"bottom": "桌面底层 (壁纸层)", "normal": "正常窗口层级", "top": "总是置顶"}
-        self.toast.show_message(f"已切换为: {labels.get(mode, mode)}")
+        labels = {"bottom": "桌面底层", "normal": "普通窗口", "top": "始终置顶"}
+        self.toast.show_message(f"层级：{labels.get(mode, mode)}")
 
     def toggle_lock_position(self):
         new_locked = not self.is_locked()
@@ -1739,7 +2042,7 @@ class BigFolderWindow(QWidget):
             self.config_manager.update_instance(self.instance_id, {"locked": new_locked})
         else:
             self.config_manager.set("locked", new_locked)
-        self.toast.show_message("卡片位置已锁定" if new_locked else "卡片位置已解锁")
+        self.toast.show_message("已锁定卡片" if new_locked else "已解锁卡片")
 
 
     def on_slot_item_changed(self, index: int, new_item: dict):
@@ -1765,7 +2068,7 @@ class BigFolderWindow(QWidget):
             items.pop(index)
             self.set_current_folder_items(items)
             self.rebuild_grid()
-            self.toast.show_message(f"已移除: {removed_name}")
+            self.toast.show_message(f"已移除 {removed_name}")
 
     def on_slot_item_moved(self, from_idx: int, to_idx: int):
         folder = self.get_current_folder()
@@ -1882,7 +2185,7 @@ class BigFolderWindow(QWidget):
             names_str = ", ".join(names[:2])
             if len(names) > 2:
                 names_str += f" 等 {len(names)} 项"
-            self.toast.show_message(f"已收纳: {names_str}")
+            self.toast.show_message(f"已添加 {names_str}")
 
         # If drawer is open, refresh items immediately
         if self.is_drawer_open() and self.current_drawer:
@@ -1927,7 +2230,7 @@ class BigFolderWindow(QWidget):
         names_str = ", ".join(names[:2])
         if len(names) > 2:
             names_str += f" 等 {len(names)} 项"
-        self.toast.show_message(f"已收纳网页书签: {names_str}")
+        self.toast.show_message(f"已添加书签 {names_str}")
 
         if self.is_drawer_open() and self.current_drawer:
             updated_folder = self.get_current_folder()
@@ -1935,7 +2238,11 @@ class BigFolderWindow(QWidget):
                 self.current_drawer.update_items(updated_folder.get("items", []))
 
     def on_request_add_web(self, slot_index: int = -1):
-        dlg = AddWebBookmarkDialog(self, existing_subgroups=self.get_current_subgroups())
+        dlg = AddWebBookmarkDialog(
+            None,
+            existing_subgroups=self.get_current_subgroups(),
+            config_manager=self.config_manager,
+        )
         if dlg.exec():
             bm = dlg.get_bookmark_data()
             if bm:
@@ -1960,7 +2267,7 @@ class BigFolderWindow(QWidget):
     def on_request_add(self, slot_index: int = -1):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择要添加的应用程序或快捷方式",
+            "选择应用或快捷方式",
             "",
             "应用程序与快捷方式 (*.exe *.lnk *.bat *.cmd *.url);;所有文件 (*.*)"
         )
@@ -2053,7 +2360,7 @@ class BigFolderWindow(QWidget):
 
         # 去重检查：若目标文件夹已存在该路径，则不重复添加
         if any(it.get("path") == item_path for it in items):
-            self.toast.show_message(f"【{item_name}】已在当前文件夹中")
+            self.toast.show_message(f"「{item_name}」已在当前分类中")
             return True
 
         # 物理迁移（若为托管存储模式）
@@ -2075,7 +2382,7 @@ class BigFolderWindow(QWidget):
         if self.is_drawer_open() and self.current_drawer:
             self.current_drawer.update_items(items)
 
-        # 从源大文件夹窗口/配置中安全移除
+        # 从源窗口/配置中安全移除
         src_win = next((w for w in BigFolderWindow._instances if w.get_current_folder_name() == src_folder), None)
         if src_win:
             src_win._internal_slot_drag_handled = True
@@ -2092,7 +2399,7 @@ class BigFolderWindow(QWidget):
                 s_items = [it for it in s_folder.get("items", []) if it.get("path") != item_path]
                 self.config_manager.set_folder_items(src_folder, s_items, auto_save=True)
 
-        self.toast.show_message(f"已将【{item_name}】从【{src_folder}】移至【{target_folder}】")
+        self.toast.show_message(f"已移至「{target_folder}」")
         return True
 
     def on_storage_synced(self, folder_name: str, items: list):
@@ -2113,7 +2420,7 @@ class BigFolderWindow(QWidget):
             self.title_label.set_text(self.get_display_title_text())
             self.adjustSize()
             if getattr(self, "is_primary", False):
-                self.toast.show_message(f"已自动同步本地物理分类: {', '.join(imported_folders)}", duration_ms=2500)
+                self.toast.show_message(f"已同步分类：{', '.join(imported_folders)}", duration_ms=2500)
 
     def on_request_move_to_desktop(self, item_path: str):
         if not item_path:
@@ -2121,7 +2428,7 @@ class BigFolderWindow(QWidget):
         dest = None
         if hasattr(self, "storage_engine"):
             dest = self.storage_engine.move_out_to_desktop(item_path)
-        # 必须确保 dest 不为 None（即桌面物理移动或快捷方式创建真实成功着床），才从大文件夹中移除，严防图标凭空蒸发
+        # 必须确保 dest 不为 None（即桌面物理移动或快捷方式创建真实成功着床），才从分类中移除，严防图标凭空蒸发
         if dest is not None:
             folder = self.get_current_folder()
             if folder:
@@ -2138,17 +2445,17 @@ class BigFolderWindow(QWidget):
             self.storage_engine.delete_item(item_path)
 
     def action_tidy_desktop(self, auto_categorize: bool = True):
-        # 1. 若当前二级展开全景抽屉处于打开状态，立即彻底收起，消除全屏置顶透明遮罩
+        # 1. 若当前二级展开抽屉处于打开状态，立即收起，消除全屏置顶透明遮罩
         if self.is_drawer_open():
             self.close_expanded_drawer(immediately=True)
 
         active_name = self.get_current_folder_name()
         if auto_categorize:
-            title = "一键收纳桌面散落图标 (智能分类)"
-            msg = "即将扫描 Windows 桌面散落的图标、快捷方式与文档，自动归类收纳进各专属大文件夹（常用应用、工作办公、游戏、系统工具），彻底接管并还给您一个纯净高颜值的桌面！\n\n是否立即执行智能收纳？"
+            title = "智能收纳桌面图标"
+            msg = "扫描桌面上的快捷方式与文件，按类型自动归入对应分类卡片。\n\n是否继续？"
         else:
-            title = f"收纳桌面散落图标到【{active_name}】"
-            msg = f"即将扫描 Windows 桌面散落图标，物理收纳至当前【{active_name}】大文件夹。\n\n是否立即执行收纳？"
+            title = f"收纳到「{active_name}」"
+            msg = f"将桌面上的图标收纳至当前分类「{active_name}」。\n\n是否继续？"
 
         # 2. 居中且置顶显示现代原生确认对话框，彻底杜绝被底层窗口或置顶图层遮挡锁死
         msg_box = QMessageBox(QMessageBox.Icon.Question, title, msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
@@ -2169,10 +2476,10 @@ class BigFolderWindow(QWidget):
                     self.manager.validate_and_separate_all_desktop_cards(from_user=True)
 
             if created_cats:
-                msg = f"一键智能规整完成：已整理 {count} 个项目，并为您生成 {len(created_cats)} 个专属大文件夹！"
+                msg = f"已整理 {count} 项，新增 {len(created_cats)} 张分类卡片"
             else:
-                msg = f"一键收纳完成：已整理 {count} 个桌面项目！"
-            self.toast.show_message(msg, duration_ms=4000)
+                msg = f"已整理 {count} 项桌面图标"
+            self.toast.show_message(msg, duration_ms=3200)
 
             self.rebuild_grid()
             for w in BigFolderWindow._instances:
@@ -2202,8 +2509,8 @@ class BigFolderWindow(QWidget):
                 w.rebuild_grid()
 
         self.toast.show_message(
-            f"智能规整完成：已剔除 {res.get('deduped_count', 0)} 个重复图标，生成 {len(created_cats)} 个分类大文件夹！",
-            duration_ms=4000
+            f"整理完成：移除 {res.get('deduped_count', 0)} 个重复项，新增 {len(created_cats)} 张卡片",
+            duration_ms=3200
         )
 
     def action_open_storage_dir(self):
@@ -2225,9 +2532,9 @@ class BigFolderWindow(QWidget):
         imported = self.storage_engine.import_existing_storage_folders()
         if imported:
             self.rebuild_grid()
-            self.toast.show_message(f"成功导入 {len(imported)} 个物理分类: {', '.join(imported)}")
+            self.toast.show_message(f"已导入 {len(imported)} 个分类：{', '.join(imported)}")
         else:
-            self.toast.show_message("所有物理分类已在列表中或未检测到新子目录")
+            self.toast.show_message("未发现新的本地分类")
 
 
     def action_open_asset_migrator(self):
@@ -2253,7 +2560,7 @@ class BigFolderWindow(QWidget):
             if hasattr(w, "bound_folder_name") and w.bound_folder_name:
                 active_displayed_categories.add(w.bound_folder_name)
 
-        options = ["新建全新分类..."]
+        options = ["新建分类..."]
         option_map = {}
         for cat in existing_cat_names:
             if cat in active_displayed_categories:
@@ -2265,8 +2572,8 @@ class BigFolderWindow(QWidget):
 
         chosen, ok = QInputDialog.getItem(
             self,
-            "在桌面新增分类大文件夹",
-            "选择要在桌面展示的本地物理分类，或新建独立分类:",
+            "添加桌面卡片",
+            "选择要在桌面显示的分类，或新建分类：",
             options,
             0,
             False
@@ -2274,11 +2581,11 @@ class BigFolderWindow(QWidget):
         if not ok or not chosen:
             return
 
-        if chosen == "新建全新分类...":
+        if chosen == "新建分类...":
             new_name, ok_name = QInputDialog.getText(
                 self,
-                "新建全新分类",
-                "请输入新大文件夹分类名称 (将在本地存储目录自动生成对应文件夹):"
+                "新建分类",
+                "请输入新分类名称："
             )
             if not ok_name or not new_name.strip():
                 return
@@ -2300,6 +2607,16 @@ class BigFolderWindow(QWidget):
                 if os.path.isdir(f_dir):
                     self.storage_engine.set_folder_storage_mapped(target_name, True)
                     self.storage_engine.sync_folder_from_storage(target_name)
+
+        # 若该分类已在桌面存在活动卡片，直接复用并提示，绝不生成重复卡片
+        existing_card = next(
+            (w for w in BigFolderWindow._instances if getattr(w, "bound_folder_name", None) == target_name),
+            None,
+        )
+        if existing_card is not None:
+            existing_card.show()
+            self.toast.show_message(f"「{target_name}」卡片已在桌面")
+            return
 
         screen = QApplication.screenAt(self.geometry().center()) or QApplication.primaryScreen()
         screen_geo = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
@@ -2347,14 +2664,14 @@ class BigFolderWindow(QWidget):
             )
             new_win.show()
 
-        self.toast.show_message(f"已在桌面创建【{target_name}】大文件夹！")
+        self.toast.show_message(f"已添加「{target_name}」卡片")
 
     def action_close_this_instance(self):
         target_name = self.get_current_folder_name()
         reply = QMessageBox.question(
             self,
             "关闭此卡片",
-            f"确定要从桌面关闭【{target_name}】大文件夹吗？\n\n提示：此操作仅关闭桌面小组件卡片，绝对不会删除任何分类与本地物理文件。\n后续可随时通过右键菜单重新添加。",
+            f"确定从桌面移除「{target_name}」卡片吗？\n\n分类与本地文件仍会保留，可随时在设置中重新开启。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -2374,10 +2691,42 @@ class BigFolderWindow(QWidget):
             BigFolderWindow._instances.remove(self)
         if self.manager is not None and hasattr(self, "instance_id") and self.instance_id in self.manager.windows:
             self.manager.windows.pop(self.instance_id, None)
+        if hasattr(self, "drag_hover_timer") and self.drag_hover_timer is not None:
+            try:
+                self.drag_hover_timer.stop()
+            except Exception:
+                pass
+        overlay = getattr(self, "_page_turn_overlay", None)
+        if overlay is not None:
+            try:
+                overlay.stop_and_hide()
+            except Exception:
+                pass
+        preview = getattr(self, "_drag_preview", None)
+        if preview is not None:
+            self._drag_preview = None
+            try:
+                preview.hide()
+                preview.close()
+                preview.deleteLater()
+            except Exception:
+                pass
         if hasattr(self, "desktop_watchdog"):
             self.desktop_watchdog.stop()
-        if getattr(self, "_owns_storage_engine", True) and hasattr(self, "storage_engine"):
-            self.storage_engine.stop()
+        if hasattr(self, "storage_engine") and self.storage_engine is not None:
+            for sig_name, slot_fn in (
+                ("storage_synced", self.on_storage_synced),
+                ("storage_folders_imported", self.on_storage_folders_imported),
+                ("operation_message", self._on_storage_operation_message),
+            ):
+                sig = getattr(self.storage_engine, sig_name, None)
+                if sig is not None:
+                    try:
+                        sig.disconnect(slot_fn)
+                    except Exception:
+                        pass
+            if getattr(self, "_owns_storage_engine", True):
+                self.storage_engine.stop()
         self.unregister_global_hotkey()
 
         # Primary role handoff
@@ -2546,23 +2895,16 @@ class BigFolderWindowManager:
         if ev_cfg.get("enabled", True):
             self.init_everything_widget(ev_cfg)
 
-        # 小组件基类默认 dark，启动时必须显式下发用户主题
-        theme = self.config_manager.get("theme", "dark")
-        for attr in ("weather_window", "clock_window", "monitor_window",
-                     "memo_window", "media_window", "everything_window"):
-            widget_win = getattr(self, attr, None)
-            if widget_win is not None and hasattr(widget_win, "set_theme"):
-                widget_win.set_theme(theme)
+        # 小组件基类默认 dark，启动时显式同步玻璃参数与用户主题
+        self._apply_glass_to_widgets()
 
         # 启动完全沿用 config 里保存的位置：自动整理会改写用户排好的桌面。
         # 只在用户主动「对齐 / 整理」时写回；屏幕变化只做临时避让（persist=False）。
         self.bind_all_widget_resizes()
         self._install_screen_watch()
         if self.layout_scale != 1.0:
-            # 缩放后贴边卡片可能有几像素舍入越界，静默钳一次；不拆重叠、不写盘
-            size = layout_scale.current_screen_size()
-            if size:
-                self._clamp_once(QRect(0, 0, size[0], size[1]))
+            # 缩放后贴边卡片可能有几像素舍入越界，按各自所在显示器静默钳一次；不拆重叠、不写盘
+            self._clamp_once()
 
         # 首帧渲染完成后修剪一次工作集：PySide6 / WinRT 导入期与启动解包的冷页
         # 交回系统，任务管理器里的常驻内存从 ~260MB 降到 ~30MB，且不影响状态。
@@ -2610,6 +2952,66 @@ class BigFolderWindowManager:
         return (layout_scale.to_screen(int(cfg.get("x", default_x)), s),
                 layout_scale.to_screen(int(cfg.get("y", default_y)), s))
 
+    def _apply_widget_glass(self, win, radius: Optional[int] = None,
+                            opacity: Optional[float] = None, theme: Optional[str] = None):
+        if win is None:
+            return
+        if radius is None:
+            s = getattr(self, "layout_scale", 1.0) or 1.0
+            radius = layout_scale.to_screen(self.config_manager.get("border_radius", 26), s)
+        if opacity is None:
+            opacity = float(self.config_manager.get("opacity", 0.88))
+        if theme is None:
+            theme = str(self.config_manager.get("theme", "dark"))
+        if hasattr(win, "set_glass_params"):
+            win.set_glass_params(radius, opacity, theme)
+        elif hasattr(win, "set_theme"):
+            win.set_theme(theme)
+
+    def _apply_glass_to_widgets(self, radius: Optional[int] = None,
+                                opacity: Optional[float] = None, theme: Optional[str] = None):
+        s = getattr(self, "layout_scale", 1.0) or 1.0
+        base_r = int(self.config_manager.get("border_radius", 26)) if radius is None else int(radius)
+        eff_r = layout_scale.to_screen(base_r, s) if radius is None else int(radius)
+        eff_op = float(self.config_manager.get("opacity", 0.88)) if opacity is None else float(opacity)
+        eff_theme = str(self.config_manager.get("theme", "dark")) if theme is None else str(theme)
+        self._last_glass_sig = (eff_r, round(eff_op, 3), eff_theme)
+        for attr in ("weather_window", "clock_window", "monitor_window",
+                     "memo_window", "media_window", "everything_window", "file_shelf_window"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                self._apply_widget_glass(w, eff_r, eff_op, eff_theme)
+
+    def _sync_glass_if_changed(self):
+        s = getattr(self, "layout_scale", 1.0) or 1.0
+        eff_r = layout_scale.to_screen(int(self.config_manager.get("border_radius", 26)), s)
+        eff_op = float(self.config_manager.get("opacity", 0.88))
+        eff_theme = str(self.config_manager.get("theme", "dark"))
+        sig = (eff_r, round(eff_op, 3), eff_theme)
+        if getattr(self, "_last_glass_sig", None) != sig:
+            self._apply_glass_to_widgets(eff_r, eff_op, eff_theme)
+
+    def refresh_card_style(self, radius: Optional[int] = None,
+                           opacity: Optional[float] = None, theme: Optional[str] = None):
+        """Refreshes border_radius, opacity, and theme across all folder cards and active desktop widgets."""
+        base_r = int(self.config_manager.get("border_radius", 26)) if radius is None else int(radius)
+        eff_op = float(self.config_manager.get("opacity", 0.88)) if opacity is None else float(opacity)
+        eff_theme = str(self.config_manager.get("theme", "dark")) if theme is None else str(theme)
+        s = getattr(self, "layout_scale", 1.0) or 1.0
+        eff_r = layout_scale.to_screen(base_r, s)
+        for win in list(self.windows.values()):
+            win.theme = eff_theme
+            win_s = getattr(win, "layout_scale", s) or 1.0
+            win_r = layout_scale.to_screen(base_r, win_s)
+            if hasattr(win, "card") and win.card is not None:
+                win.card.set_card_style(win_r, eff_op, theme=eff_theme)
+            if hasattr(win, "toast") and win.toast is not None and win.toast.isVisible():
+                win.toast.update()
+            if hasattr(win, "apply_blur_effect"):
+                win.apply_blur_effect()
+            win.rebuild_grid()
+        self._apply_glass_to_widgets(eff_r, eff_op, eff_theme)
+
     # ------------------------------------------------------------------
     # 小组件装配（天气 / 时钟 / 硬件 / 便签 / 播放器 / 中转站 / 搜索）
     # ------------------------------------------------------------------
@@ -2622,6 +3024,8 @@ class BigFolderWindowManager:
             widget_size=cfg.get("size", "2x2"),
             locked=bool(cfg.get("locked", False)),
             config_manager=self.config_manager)
+        win.manager = self
+        self._apply_widget_glass(win)
         win.position_changed.connect(self._on_weather_pos_changed)
         win.show()
         self.weather_window = win
@@ -2629,6 +3033,7 @@ class BigFolderWindowManager:
     def init_clock_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import ClockWidgetWindow
         win = ClockWidgetWindow(self.config_manager)
+        win.manager = self
         win.move(*self._widget_screen_pos(cfg, 300, 180))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
@@ -2636,6 +3041,7 @@ class BigFolderWindowManager:
                 win.set_size_mode(mode)
             except Exception:
                 pass
+        self._apply_widget_glass(win)
         win.position_changed.connect(self._on_clock_pos_changed)
         win.show()
         self.clock_window = win
@@ -2643,6 +3049,7 @@ class BigFolderWindowManager:
     def init_monitor_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import SystemMonitorWidgetWindow
         win = SystemMonitorWidgetWindow(self.config_manager)
+        win.manager = self
         win.move(*self._widget_screen_pos(cfg, 900, 180))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
@@ -2650,6 +3057,7 @@ class BigFolderWindowManager:
                 win.set_size_mode(mode)
             except Exception:
                 pass
+        self._apply_widget_glass(win)
         win.position_changed.connect(self._on_monitor_pos_changed)
         win.show()
         self.monitor_window = win
@@ -2657,6 +3065,7 @@ class BigFolderWindowManager:
     def init_memo_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import MemoWidgetWindow
         win = MemoWidgetWindow(self.config_manager)
+        win.manager = self
         win.move(*self._widget_screen_pos(cfg, 600, 400))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
@@ -2664,6 +3073,7 @@ class BigFolderWindowManager:
                 win.set_size_mode(mode)
             except Exception:
                 pass
+        self._apply_widget_glass(win)
         win.position_changed.connect(self._on_memo_pos_changed)
         win.show()
         self.memo_window = win
@@ -2671,6 +3081,7 @@ class BigFolderWindowManager:
     def init_media_widget(self, cfg: Dict[str, Any]):
         from desktop_widgets import NowPlayingWidgetWindow
         win = NowPlayingWidgetWindow(self.config_manager)
+        win.manager = self
         win.move(*self._widget_screen_pos(cfg, 1200, 200))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
@@ -2678,6 +3089,7 @@ class BigFolderWindowManager:
                 win.set_size_mode(mode)
             except Exception:
                 pass
+        self._apply_widget_glass(win)
         win.position_changed.connect(self._on_media_pos_changed)
         win.show()
         self.media_window = win
@@ -2685,6 +3097,8 @@ class BigFolderWindowManager:
     def init_file_shelf(self, cfg: Dict[str, Any]):
         from file_shelf import FileShelfWindow
         win = FileShelfWindow(self.config_manager)
+        win.manager = self
+        self._apply_widget_glass(win)
         # 中转站按 edge + y_ratio 自己贴边落位，这里再 move 会二次定位导致跳动
         win.show()
         self.file_shelf_window = win
@@ -2706,6 +3120,7 @@ class BigFolderWindowManager:
     def init_everything_widget(self, cfg: Dict[str, Any]):
         from everything_widget import EverythingWidgetWindow
         win = EverythingWidgetWindow(config_manager=self.config_manager)
+        win.manager = self
         win.move(*self._widget_screen_pos(cfg, 620, 420))
         mode = cfg.get("size", "2x2")
         if mode != "2x2" and hasattr(win, "set_size_mode"):
@@ -2713,6 +3128,7 @@ class BigFolderWindowManager:
                 win.set_size_mode(mode)
             except Exception:
                 pass
+        self._apply_widget_glass(win)
         win.position_changed.connect(self._on_everything_pos_changed)
         win.show()
         self.everything_window = win
@@ -2754,10 +3170,10 @@ class BigFolderWindowManager:
                 cards.append((inst_id, win))
         if len(cards) < 2:
             return
-        screen = QApplication.primaryScreen()
-        safe_right = screen.availableGeometry().right() if screen else 1920
         placed = []
         for inst_id, win in cards:
+            win_avail = layout_scale.screen_available_geometry_for_widget(win)
+            safe_right = win_avail.right() if win_avail is not None else 1920
             rect = QRect(win.pos() + win.card.pos(), win.card.size())
             for prev in placed:
                 overlap = rect.intersected(prev)
@@ -2871,13 +3287,52 @@ class BigFolderWindowManager:
                 targets.append(widget)
         return targets
 
-    def _clamp_once(self, avail):
+    def _resolve_window_avail(self, win, fallback_avail: Optional[QRect] = None) -> Optional[QRect]:
+        """返回窗口实际所在屏幕的 availableGeometry；仅在脱屏或副屏断开时回退主屏。"""
+        app = QApplication.instance()
+        primary = QApplication.primaryScreen() if app is not None else None
+        primary_avail = primary.availableGeometry() if primary is not None else None
+        screens = app.screens() if (app is not None and hasattr(app, "screens")) else []
+
+        scr = None
+        if app is not None and win is not None:
+            try:
+                if hasattr(win, "geometry") and callable(win.geometry):
+                    center = win.geometry().center()
+                else:
+                    center = QRect(
+                        int(win.x()), int(win.y()), int(win.width()), int(win.height())
+                    ).center()
+                scr = QApplication.screenAt(center)
+            except Exception:
+                scr = None
+
+        if scr is not None and screens and scr is screens[0] and primary is not None:
+            scr = primary
+
+        if fallback_avail is not None:
+            if scr is not None and primary is not None and scr is not primary:
+                return scr.availableGeometry()
+            if primary_avail is None or fallback_avail != primary_avail:
+                return fallback_avail
+
+        if scr is not None:
+            return scr.availableGeometry()
+        win_avail = layout_scale.screen_available_geometry_for_widget(win)
+        if win_avail is not None:
+            return win_avail
+        return fallback_avail or primary_avail
+
+    def _clamp_once(self, avail: Optional[QRect] = None):
         for win in self._widget_targets():
             try:
-                max_x = avail.left() + max(0, avail.width() - win.width())
-                max_y = avail.top() + max(0, avail.height() - win.height())
-                new_x = max(avail.left(), min(win.x(), max_x))
-                new_y = max(avail.top(), min(win.y(), max_y))
+                win_avail = self._resolve_window_avail(win, avail)
+                if win_avail is None:
+                    continue
+                max_x = win_avail.left() + max(0, win_avail.width() - win.width())
+                max_y = win_avail.top() + max(0, win_avail.height() - win.height())
+                new_x = max(win_avail.left(), min(win.x(), max_x))
+                new_y = max(win_avail.top(), min(win.y(), max_y))
                 if (new_x, new_y) != (win.x(), win.y()):
                     # 临时避让只改显示；emit position_changed 会把远程分辨率下的
                     # 避让坐标写回 config，用户原布局就再也回不去了。
@@ -2885,8 +3340,8 @@ class BigFolderWindowManager:
             except Exception:
                 pass
 
-    def _clamp_all_to_screen(self, avail):
-        """夹进可用区域。拆分重叠可能把卡片又推出边界，所以要「钳位→拆分」迭代收敛。"""
+    def _clamp_all_to_screen(self, avail: Optional[QRect] = None):
+        """夹进各自所在屏幕可用区域。拆分重叠可能把卡片又推出边界，所以要「钳位→拆分」迭代收敛。"""
         if getattr(self, "is_zen_hidden", False):
             return
         self._clamp_once(avail)
@@ -2896,12 +3351,17 @@ class BigFolderWindowManager:
         # 卡片被重新排布后，压在上面的小组件要跟着让位（同样不写回用户布局）
         self.separate_widgets_from_cards(persist=False)
 
-    def _any_window_outside(self, avail):
+    def _any_window_outside(self, avail: Optional[QRect] = None) -> bool:
         for win in self._widget_targets():
             try:
-                if (win.x() < avail.left() or win.y() < avail.top()
-                        or win.x() + win.width() > avail.right()
-                        or win.y() + win.height() > avail.bottom()):
+                win_avail = self._resolve_window_avail(win, avail)
+                if win_avail is None:
+                    continue
+                avail_right = win_avail.left() + win_avail.width()
+                avail_bottom = win_avail.top() + win_avail.height()
+                if (win.x() < win_avail.left() or win.y() < win_avail.top()
+                        or win.x() + win.width() > avail_right
+                        or win.y() + win.height() > avail_bottom):
                     return True
             except Exception:
                 continue
@@ -2912,13 +3372,12 @@ class BigFolderWindowManager:
         if getattr(self, "is_zen_hidden", False):
             return
         app = QApplication.instance()
-        screen = app.primaryScreen() if app else None
+        screen = QApplication.primaryScreen() if app else None
         if screen is None:
             return
-        avail = screen.availableGeometry()
-        if self._any_window_outside(avail):
-            self._clamp_all_to_screen(avail)
-            self._last_screen_geo = avail
+        if self._any_window_outside():
+            self._clamp_all_to_screen()
+            self._last_screen_geo = screen.availableGeometry()
 
     def apply_layout_scale(self):
         """按当前屏幕重算所有桌面元素的显示坐标与尺寸。
@@ -2954,6 +3413,8 @@ class BigFolderWindowManager:
                 if hasattr(win, "on_card_resized"):
                     win.on_card_resized()
 
+        self._apply_glass_to_widgets()
+
         if hidden and old_s and new_s != old_s:
             # 禅模式窗口在屏外，只换算记账坐标，退出时仍落回正确位置
             ratio = new_s / old_s
@@ -2963,18 +3424,23 @@ class BigFolderWindowManager:
 
     def _reflow_for_screen_change(self, *args):
         app = QApplication.instance()
-        screen = app.primaryScreen() if app else None
+        screen = QApplication.primaryScreen() if app else None
         if screen is None:
             return
         avail = screen.availableGeometry()
-        if getattr(self, "_last_screen_geo", None) == avail:
+        all_geoms = tuple(s.availableGeometry() for s in app.screens()) if hasattr(app, "screens") else (avail,)
+        prev_geo = getattr(self, "_last_screen_geo", None)
+        prev_all = getattr(self, "_last_all_screen_geos", None)
+        if prev_geo == avail and (prev_all is None or prev_all == all_geoms):
             return
+        primary_changed = (prev_geo != avail)
         self._last_screen_geo = avail
-        self.apply_layout_scale()
-        # 等比缩放后相对布局不变；只有真的越界才做一次临时钳位，
-        # 否则拆分重叠会把用户摆好的位置搬动。
-        if self._any_window_outside(avail):
-            self._clamp_all_to_screen(avail)
+        self._last_all_screen_geos = all_geoms
+        if primary_changed:
+            self.apply_layout_scale()
+        # 等比缩放后相对布局不变；只有真的越出各自所在屏幕才做临时钳位
+        if self._any_window_outside():
+            self._clamp_all_to_screen()
 
     @staticmethod
     def _find_free_desktop_slot(size: QSize, occupied, avail: QRect, gap: int = 16,
@@ -3015,25 +3481,27 @@ class BigFolderWindowManager:
             return
         from grid_snap import get_desktop_icons_exclusion_rect, resolve_card_collision
 
-        screen = QApplication.primaryScreen()
-        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
-        icon_zone = get_desktop_icons_exclusion_rect(avail)
+        primary = QApplication.primaryScreen()
+        primary_avail = primary.availableGeometry() if primary else QRect(0, 0, 1920, 1080)
+        icon_zone = get_desktop_icons_exclusion_rect(primary_avail)
 
         placed = []
         for inst_id, win in list(self.windows.items()):
             card = getattr(win, "card", None)
             if card is None:
                 continue
+            avail = layout_scale.screen_available_geometry_for_widget(win) or primary_avail
+            on_primary = (avail == primary_avail)
             rect = QRect(win.pos() + card.pos(), card.size())
             conflicts = list(placed)
-            if icon_zone and not icon_zone.isEmpty():
+            if on_primary and icon_zone and not icon_zone.isEmpty():
                 conflicts.append(icon_zone)
             # 与卡片间的小缝隙重叠（<400px²）不算冲突，避免为了几像素把卡片推走几十像素
             meaningful = any(
                 rect.intersected(o).width() * rect.intersected(o).height() > 400
                 for o in conflicts if o is not icon_zone)
             needs_fix = (not avail.contains(rect)) or meaningful or (
-                icon_zone is not None and not icon_zone.isEmpty() and rect.intersects(icon_zone))
+                on_primary and icon_zone is not None and not icon_zone.isEmpty() and rect.intersects(icon_zone))
             if needs_fix and conflicts:
                 new_pt = resolve_card_collision(rect, conflicts, avail, card_gap=16)
                 if new_pt != rect.topLeft():
@@ -3105,10 +3573,11 @@ class BigFolderWindowManager:
         cards = self._placement_obstacles()
 
         screen = QApplication.primaryScreen()
-        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
+        fallback_avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1080)
         now = time.monotonic()
         placed = list(cards)
         for win, w_type in pairs:
+            avail = layout_scale.screen_available_geometry_for_widget(win) or fallback_avail
             rect = QRect(win.pos() + QPoint(MARGIN_SHADOW, MARGIN_SHADOW),
                          QSize(win.card_w, win.card_h))
             # 正在拖 / 刚松手 2 秒内不参与自动搬运，否则会和用户抢鼠标
@@ -3203,7 +3672,8 @@ class BigFolderWindowManager:
                 continue
             o_off = other.card.pos() if getattr(other, "card", None) is not None else offset
             obstacles.append(QRect(other.pos() + o_off, QSize(other.card_w, other.card_h)))
-        target = widget_grid.snap_card_rect(cur, obstacles, widget_grid.available_geometry())
+        avail = self._resolve_window_avail(win) or widget_grid.available_geometry()
+        target = widget_grid.snap_card_rect(cur, obstacles, avail)
         if target is None or target.topLeft() == cur.topLeft():
             return False
         win.move(target.topLeft() - offset)
@@ -3239,6 +3709,11 @@ class BigFolderWindowManager:
         桌面层子窗口（挂在 WorkerW 下）清不掉 WS_VISIBLE，只藏绘制体会在桌面留下白底；
         搬出屏幕是唯一确定有效、且不会闪回的隐藏方式，坐标另外记账以便原样搬回。
         """
+        if hasattr(win, "is_drawer_open") and callable(win.is_drawer_open) and win.is_drawer_open():
+            try:
+                win.close_expanded_drawer(immediately=True)
+            except Exception:
+                pass
         try:
             if not hasattr(self, "_zen_saved_positions"):
                 self._zen_saved_positions = []
@@ -3262,7 +3737,10 @@ class BigFolderWindowManager:
             if hasattr(win, "update_title_visibility"):
                 win.update_title_visibility()
         if win is not getattr(self, "file_shelf_window", None):
-            desktop_layer.pin_to_desktop(int(win.winId()))
+            if hasattr(win, "apply_layer_mode") and callable(win.apply_layer_mode):
+                win.apply_layer_mode()
+            else:
+                desktop_layer.pin_to_desktop(int(win.winId()))
 
     def toggle_zen_mode(self, animate: bool = True):
         """
@@ -3281,6 +3759,7 @@ class BigFolderWindowManager:
         if not self.is_zen_hidden:
             # 按 HWND 实际可见性记账：桌面层窗口的 Qt isVisible() 可能滞后
             self._zen_saved_windows = [w for w in all_widgets if w.isVisible() or self._natively_visible(w)]
+            self._zen_saved_positions = []
             self.is_zen_hidden = True
             for w in self._zen_saved_windows:
                 if hasattr(w, "desktop_watchdog"):
@@ -3327,6 +3806,16 @@ class BigFolderWindowManager:
 
     def create_instance_from_data(self, inst_data: dict) -> BigFolderWindow:
         inst_id = inst_data.get("instance_id")
+        if inst_id and inst_id in self.windows and self.windows[inst_id] is not None:
+            existing = self.windows[inst_id]
+            existing.show()
+            return existing
+        target_folder = inst_data.get("folder_name")
+        if target_folder:
+            for existing_win in self.windows.values():
+                if existing_win is not None and getattr(existing_win, "bound_folder_name", None) == target_folder:
+                    existing_win.show()
+                    return existing_win
         win = BigFolderWindow(
             config_manager=self.config_manager,
             instance_id=inst_id,
@@ -3338,6 +3827,10 @@ class BigFolderWindowManager:
         return win
 
     def create_instance(self, folder_name: str, pos_x: int, pos_y: int, locked: bool = False, rows: int = 3, cols: int = 3) -> BigFolderWindow:
+        for existing_win in self.windows.values():
+            if existing_win is not None and getattr(existing_win, "bound_folder_name", None) == folder_name:
+                existing_win.show()
+                return existing_win
         new_inst = self.config_manager.add_instance(folder_name, pos_x, pos_y, locked, rows=rows, cols=cols)
         return self.create_instance_from_data(new_inst)
 
@@ -3359,12 +3852,12 @@ class BigFolderWindowManager:
     def open_asset_migrator(self, parent=None):
         try:
             from legacy_migrator import LegacyMigrationDialog
-            # 谁调用的就以谁为父窗口：从设置页进入时必须挂到设置页，
-            # 否则对话框会被设置页压在后面。
-            host = parent or self.get_primary_window()
-            dlg = LegacyMigrationDialog(window_manager=self, parent=host)
-            if host and hasattr(host, "toast"):
-                dlg.matrix_created.connect(lambda cats: host.toast.show_message(f"已在桌面生成 {len(cats)} 个大文件夹"))
+            # 从设置页进入时挂到设置页以保持模态层级；从桌面卡片进入时不挂底层透明窗口
+            dlg_parent = parent if (parent is not None and not isinstance(parent, BigFolderWindow)) else None
+            toast_host = parent if isinstance(parent, BigFolderWindow) else self.get_primary_window()
+            dlg = LegacyMigrationDialog(window_manager=self, parent=dlg_parent)
+            if toast_host and hasattr(toast_host, "toast"):
+                dlg.matrix_created.connect(lambda cats: toast_host.toast.show_message(f"已添加 {len(cats)} 张分类卡片"))
             dlg.exec()
         except Exception as e:
             print("Failed to open asset migrator dialog:", e)
@@ -3375,8 +3868,7 @@ class BigFolderWindowManager:
     def open_settings_dialog(self, tab_index: int = 0):
         try:
             from settings_dialog import SettingsDialog
-            primary = self.get_primary_window()
-            dlg = SettingsDialog(self.config_manager, window_manager=self, initial_tab=tab_index, parent=primary)
+            dlg = SettingsDialog(self.config_manager, window_manager=self, initial_tab=tab_index, parent=None)
             dlg.exec()
         except Exception as e:
             print("Failed to open settings dialog:", e)
@@ -3465,17 +3957,17 @@ class BigFolderWindowManager:
             else:
                 target_win.summon_card_to_front(target_screen=active_screen)
 
-    def notify_ready(self, message: str = "仿手机大文件夹已就绪！"):
+    def notify_ready(self, message: str = ""):
         primary = self.get_primary_window()
         for w in self.windows.values():
             if not w.isVisible():
                 w.show()
             if hasattr(w, "desktop_watchdog") and w.config_manager.get("layer_mode", "bottom") == "bottom":
                 w.desktop_watchdog.re_bed()
-        if primary:
+        if primary and message:
             primary.toast.show_message(message)
 
-    def bring_to_front_and_toast(self, message: str = "仿手机大文件夹已就绪！"):
+    def bring_to_front_and_toast(self, message: str = ""):
         if self.is_zen_hidden:
             self.toggle_zen_mode(animate=False)
 
@@ -3490,7 +3982,7 @@ class BigFolderWindowManager:
                 w.update_title_visibility()
             w.show()
             w.apply_layer_mode()
-        if primary:
+        if primary and message:
             primary.toast.show_message(message)
 
     def set_all_layer_mode(self, mode: str):
@@ -3503,14 +3995,14 @@ class BigFolderWindowManager:
         if not primary:
             f_name = self.config_manager.get_active_folder_name()
             primary = self.create_instance(f_name, 797, 49)
-            primary.toast.show_message("已为您恢复桌面大文件夹")
+            primary.toast.show_message("已恢复桌面卡片")
             return
         primary.action_create_desktop_instance()
 
     def lock_all_instances(self, locked: bool):
         self.config_manager.set_all_instances_locked(locked)
         for w in self.windows.values():
-            w.toast.show_message("所有卡片已锁定" if locked else "所有卡片已解锁")
+            w.toast.show_message("已锁定全部卡片" if locked else "已解锁全部卡片")
 
     def toggle_lock_all(self):
         cur = bool(self.config_manager.get("locked", False))
@@ -3529,20 +4021,61 @@ class BigFolderWindowManager:
             primary.action_tidy_desktop(auto_categorize=auto_categorize)
 
     def close_all(self):
-        if hasattr(self, "shared_storage_engine"):
-            self.shared_storage_engine.stop()
-        if getattr(self, "weather_window", None):
-            self.weather_window.close()
-            self.weather_window = None
-        if getattr(self, "clock_window", None):
-            self.clock_window.close()
-            self.clock_window = None
-        if getattr(self, "monitor_window", None):
-            self.monitor_window.close()
-            self.monitor_window = None
-        if getattr(self, "memo_window", None):
-            self.memo_window.close()
-            self.memo_window = None
+        if getattr(self, "_clamp_timer", None) is not None:
+            try:
+                self._clamp_timer.stop()
+            except Exception:
+                pass
+            self._clamp_timer = None
+
+        if getattr(self, "desktop_blank_handler", None) is not None:
+            try:
+                self.desktop_blank_handler.disable()
+            except Exception:
+                pass
+
+        if getattr(self, "shared_storage_engine", None) is not None:
+            try:
+                self.shared_storage_engine.stop()
+            except Exception:
+                pass
+
+        for attr in ("weather_window", "clock_window", "monitor_window", "memo_window",
+                     "media_window", "everything_window", "file_shelf_window"):
+            widget_win = getattr(self, attr, None)
+            if widget_win is not None:
+                if getattr(widget_win, "desktop_watchdog", None) is not None:
+                    try:
+                        widget_win.desktop_watchdog.stop()
+                    except Exception:
+                        pass
+                try:
+                    widget_win.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
         for w in list(self.windows.values()):
-            w.close()
+            if getattr(w, "desktop_watchdog", None) is not None:
+                try:
+                    w.desktop_watchdog.stop()
+                except Exception:
+                    pass
+            try:
+                w.close()
+            except Exception:
+                pass
         self.windows.clear()
+
+        # Shut down singleton background service executors if already instantiated
+        ms_mod = sys.modules.get("media_service") or sys.modules.get("stacky.media.media_service")
+        ms_cls = getattr(ms_mod, "MediaControlService", None) if ms_mod is not None else None
+        if ms_cls is not None and hasattr(ms_cls, "shutdown_instance"):
+            try:
+                ms_cls.shutdown_instance()
+            except Exception:
+                pass
+
+
+sys.modules.setdefault("main_window", sys.modules[__name__])
+sys.modules.setdefault("stacky.core.main_window", sys.modules[__name__])

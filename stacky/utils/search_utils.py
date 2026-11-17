@@ -2,7 +2,10 @@ from typing import List, Dict, Any, Tuple, Optional
 import ast
 import functools
 import operator
+import os
 import re
+import sys
+import threading
 import urllib.parse
 import ctypes
 import subprocess
@@ -144,8 +147,12 @@ def _eval_ast_node(node: ast.AST) -> Any:
                 if right == 0:
                     raise ZeroDivisionError("division by zero")
             if op_type == ast.Pow:
-                # Security guard against CPU freezing DOS attacks
-                if abs(right) > 1000 or (abs(left) > 1e6 and abs(right) > 20):
+                # Security guard against CPU freezing DOS attacks & int string conversion limits
+                if (
+                    abs(right) > 1000
+                    or (abs(left) > 100 and abs(right) > 100)
+                    or (abs(left) > 1e6 and abs(right) > 12)
+                ):
                     raise OverflowError("Exponent value exceeds safe calculation limits")
                 res = left ** right
                 if isinstance(res, complex):
@@ -177,8 +184,8 @@ def safe_calculate_math(expression: str) -> Optional[Dict[str, Any]]:
     # Normalize full-width spaces and whitespace
     clean_expr = re.sub(r"[\s\u3000\u00a0]+", " ", clean_expr)
 
-    # Normalize thousands separator commas (e.g. 1,000 * 2 -> 1000 * 2)
-    clean_expr = re.sub(r"(\d),(\d)", r"\1\2", clean_expr)
+    # Normalize thousands separator commas (e.g. 1,000,000 * 2 -> 1000000 * 2)
+    clean_expr = re.sub(r"(?<=\d),(?=\d)", "", clean_expr)
 
     # Normalize mathematical symbols
     clean_expr = clean_expr.replace("×", "*").replace("÷", "/").replace("^", "**")
@@ -406,7 +413,25 @@ def execute_system_command(cmd_info: Dict[str, Any]) -> bool:
             return True
         cmd = cmd_info.get("cmd")
         if cmd:
-            subprocess.Popen(cmd, shell=True)
+            env = None
+            if getattr(sys, "frozen", False):
+                env = os.environ.copy()
+                exe_dir = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "executable", None) else ""
+                meipass = getattr(sys, "_MEIPASS", "") or ""
+                priv = [
+                    os.path.normcase(os.path.normpath(os.path.abspath(p)))
+                    for p in (meipass, os.path.join(exe_dir, "_internal") if exe_dir else "", exe_dir)
+                    if p
+                ]
+                env["PATH"] = os.pathsep.join(
+                    e for e in env.get("PATH", "").split(os.pathsep)
+                    if e.strip() and not any(
+                        os.path.normcase(os.path.normpath(e.strip().strip('"'))).startswith(p + os.sep)
+                        or os.path.normcase(os.path.normpath(e.strip().strip('"'))) == p
+                        for p in priv
+                    )
+                )
+            subprocess.Popen(cmd, shell=True, env=env)
             return True
     except Exception as e:
         print(f"Failed to execute system command {cmd_info}: {e}")
@@ -420,14 +445,14 @@ def execute_system_command(cmd_info: Dict[str, Any]) -> bool:
 
 _EVERYTHING_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 _EVERYTHING_CACHE_TTL = 6.0  # seconds
+_EVERYTHING_CACHE_LOCK = threading.RLock()
 
 def _log_search_error(query: str, exc: BaseException):
     """搜索异常落盘，避免 except 静默吞掉导致「搜不到」无从排查。"""
     try:
-        import os as _os
         import time as _t
         import traceback as _tb
-        path = _os.path.join(_os.environ.get("TEMP", "."), "stacky_search.log")
+        path = os.path.join(os.environ.get("TEMP", "."), "stacky_search.log")
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"[{_t.strftime('%H:%M:%S')}] query={query!r} err={exc!r}\n")
             fh.write(_tb.format_exc() + "\n")
@@ -447,9 +472,10 @@ def search_everything_files(query: str, max_results: int = 12) -> List[Dict[str,
     cache_key = f"{q.lower()}|{max_results}"
     import time as _t
     now = _t.time()
-    cached = _EVERYTHING_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _EVERYTHING_CACHE_TTL:
-        return [dict(x) for x in cached[1]]
+    with _EVERYTHING_CACHE_LOCK:
+        cached = _EVERYTHING_CACHE.get(cache_key)
+        if cached and (now - cached[0]) < _EVERYTHING_CACHE_TTL:
+            return [dict(x) for x in cached[1]]
 
     try:
         from everything_ipc import search_files
@@ -466,11 +492,16 @@ def search_everything_files(query: str, max_results: int = 12) -> List[Dict[str,
             })
         # 空结果不缓存：否则 Everything 刚启动/索引未就绪时，6 秒内再怎么搜都是空
         if items:
-            if len(_EVERYTHING_CACHE) > 64:
-                _EVERYTHING_CACHE.clear()
-            _EVERYTHING_CACHE[cache_key] = (now, items)
+            with _EVERYTHING_CACHE_LOCK:
+                if len(_EVERYTHING_CACHE) > 64:
+                    _EVERYTHING_CACHE.clear()
+                _EVERYTHING_CACHE[cache_key] = (now, [dict(x) for x in items])
         return items
     except Exception as exc:
         _log_search_error(q, exc)
         return []
+
+
+sys.modules.setdefault("search_utils", sys.modules[__name__])
+sys.modules.setdefault("stacky.utils.search_utils", sys.modules[__name__])
 

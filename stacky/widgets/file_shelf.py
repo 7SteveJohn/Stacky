@@ -11,14 +11,16 @@ file_shelf.py - Stacky 灵叠桌面文件中转站 (Desktop File Shelf / Staging
 
 import os
 import sys
+import json
 import shutil
+import weakref
 import ctypes
 from ctypes import wintypes
 from typing import List, Dict, Any, Optional
 
 from PySide6.QtCore import (
     Qt, QPoint, QPointF, QRect, QRectF, QSize, QUrl, Signal,
-    QPropertyAnimation, QEasingCurve, QMimeData, QTimer
+    QPropertyAnimation, QEasingCurve, QMimeData, QTimer, QEvent
 )
 from PySide6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QBrush,
@@ -32,18 +34,34 @@ from PySide6.QtWidgets import (
 )
 
 from config_manager import ConfigManager
-from icon_utils import get_app_icon_pixmap as get_app_icon, create_squircle_path
+from icon_utils import (
+    get_app_icon_pixmap as get_app_icon,
+    create_squircle_path,
+    STACKY_ITEM_MIME,
+    mark_cross_folder_drop,
+)
+from ui_kit import get_theme_tokens, menu_qss
+
+_SHELF_FONT_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI"]
+_SHELF_FONT_CSS = '"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif'
 
 
 def _shelf_icon(kind: str, active: bool = False, size: int = 20,
-                color: Optional[str] = None) -> QIcon:
-    """纯矢量图标。emoji 字形在 Windows 上常渲染成空白，右上角会退化成空方块。"""
-    pm = QPixmap(size, size)
+                color: Optional[str] = None, light: bool = False) -> QIcon:
+    """纯矢量图标（2x HiDPI 采样）。emoji 字形在 Windows 上常渲染成空白，右上角会退化成空方块。"""
+    px = max(2, int(size) * 2)
+    pm = QPixmap(px, px)
+    pm.setDevicePixelRatio(2.0)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     p.scale(size / 20.0, size / 20.0)
-    c = QColor(color) if color else (QColor("#60a5fa") if active else QColor("#cbd5e1"))
+    if color:
+        c = QColor(color)
+    elif light:
+        c = QColor("#2563eb") if active else QColor("#475569")
+    else:
+        c = QColor("#60a5fa") if active else QColor("#cbd5e1")
     p.setPen(QPen(c, 1.5, Qt.PenStyle.SolidLine,
                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
     p.setBrush(Qt.BrushStyle.NoBrush)
@@ -81,29 +99,59 @@ HEADER_BTN_QSS = """
     QPushButton {
         background: transparent;
         border: none;
+        padding: 0px;
         border-radius: 6px;
     }
     QPushButton:hover { background: rgba(255, 255, 255, 0.10); }
     QPushButton:pressed { background: rgba(255, 255, 255, 0.16); }
 """
 
+HEADER_BTN_LIGHT_QSS = """
+    QPushButton {
+        background: transparent;
+        border: none;
+        padding: 0px;
+        border-radius: 6px;
+    }
+    QPushButton:hover { background: rgba(15, 23, 42, 0.08); }
+    QPushButton:pressed { background: rgba(15, 23, 42, 0.14); }
+"""
+
 
 class EmptyZone(QWidget):
-    """空态投放区。QWidget 的 QSS 背景在 Qt6 下不保证绘制，纯 QPainter 才靠得住。"""
+    """空态投放区：1px 柔和虚线细描边与微透呼吸底板，纯 QPainter 抗锯齿渲染。"""
+
+    def __init__(self, parent=None, theme: str = "dark"):
+        super().__init__(parent)
+        self.theme: str = (theme or "dark").strip().lower()
+
+    def set_theme(self, theme: str):
+        self.theme = (theme or "dark").strip().lower()
+        self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        p.setBrush(QBrush(QColor("#171a21")))
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+        if self.theme == "light":
+            fill_c = QColor(15, 23, 42, 8)
+            dash_c = QColor(15, 23, 42, 38)
+        elif self.theme == "oled":
+            fill_c = QColor(255, 255, 255, 6)
+            dash_c = QColor(148, 163, 184, 42)
+        else:
+            fill_c = QColor(255, 255, 255, 8)
+            dash_c = QColor(148, 163, 184, 48)
+        p.setBrush(QBrush(fill_c))
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(rect, 12, 12)
-        pen = QPen(QColor(148, 163, 184, 70), 1)
+        p.drawRoundedRect(rect, 12.0, 12.0)
+        pen = QPen(dash_c, 1.0)
         pen.setStyle(Qt.PenStyle.DashLine)
-        pen.setDashPattern([4, 4])
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setDashPattern([5, 4])
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(rect, 12, 12)
+        p.drawRoundedRect(rect, 12.0, 12.0)
         p.end()
 
 # Win32 Constants & APIs for Fullscreen / Game Auto-Suppression
@@ -123,6 +171,26 @@ WinEventProcType = ctypes.WINFUNCTYPE(
     wintypes.DWORD,
     wintypes.DWORD
 ) if user32 else None
+
+# Keep any unhook-failed callback thunks alive so Win32 never jumps into freed memory.
+_RETIRED_WINEVENT_PROCS = []
+
+if user32 and WinEventProcType:
+    try:
+        user32.SetWinEventHook.argtypes = [
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HMODULE,
+            WinEventProcType,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        user32.SetWinEventHook.restype = wintypes.HANDLE
+        user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+        user32.UnhookWinEvent.restype = wintypes.BOOL
+    except Exception:
+        pass
 
 
 def is_window_fullscreen_or_game(hwnd: int) -> bool:
@@ -262,34 +330,32 @@ class ShelfItemWidget(QFrame):
     """Visual row for an individual staged file item."""
     removed = Signal(str)  # emits file path to remove
 
-    def __init__(self, item: StagedFileItem, parent=None):
+    def __init__(self, item: StagedFileItem, parent=None, theme: str = "dark"):
         super().__init__(parent)
         self.item = item
+        self.theme: str = (theme or "dark").strip().lower()
         self._drag_start_pos: Optional[QPoint] = None
         self.setFixedHeight(48)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("""
-            ShelfItemWidget {
-                background-color: rgba(255, 255, 255, 0.04);
-                border: 1px solid rgba(255, 255, 255, 0.06);
-                border-radius: 8px;
-            }
-            ShelfItemWidget:hover {
-                background-color: rgba(255, 255, 255, 0.08);
-                border: 1px solid rgba(96, 165, 250, 0.35);
-            }
-        """)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(10)
 
-        # 1. File Icon (28x28)
+        # 1. File Icon (28x28 HiDPI)
         self.lbl_icon = QLabel(self)
         self.lbl_icon.setFixedSize(28, 28)
-        self.lbl_icon.setScaledContents(True)
+        self.lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if item.icon and not item.icon.isNull():
-            self.lbl_icon.setPixmap(item.icon.scaled(28, 28, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            dpr = max(1.0, float(self.devicePixelRatioF() or 1.0))
+            px = max(28, int(round(28 * dpr)))
+            icon_pm = item.icon.scaled(
+                px, px,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            icon_pm.setDevicePixelRatio(dpr)
+            self.lbl_icon.setPixmap(icon_pm)
         layout.addWidget(self.lbl_icon)
 
         # 2. Name & Size Information
@@ -298,37 +364,58 @@ class ShelfItemWidget(QFrame):
         info_col.setSpacing(1)
 
         self.lbl_name = QLabel(item.name, self)
-        self.lbl_name.setStyleSheet("font-size: 12px; font-weight: 600; color: #f8fafc;")
         self.lbl_name.setToolTip(item.path)
 
         self.lbl_size = QLabel(item.size_str, self)
-        self.lbl_size.setStyleSheet("font-size: 10px; color: #94a3b8;")
 
         info_col.addWidget(self.lbl_name)
         info_col.addWidget(self.lbl_size)
         layout.addLayout(info_col, stretch=1)
 
         # 3. Quick Remove Button
-        self.btn_del = QPushButton("✕", self)
+        self.btn_del = QPushButton(self)
         self.btn_del.setFixedSize(22, 22)
+        self.btn_del.setIconSize(QSize(13, 13))
         self.btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_del.setToolTip("从中转站移除 (不删除本地原文件)")
+        self.btn_del.setToolTip("从中转站移除（不删除原文件）")
+        self.btn_del.clicked.connect(lambda: self.removed.emit(self.item.path))
+        layout.addWidget(self.btn_del)
+        self.apply_theme(self.theme)
+
+    def apply_theme(self, theme: str):
+        self.theme = (theme or "dark").strip().lower()
+        tok = get_theme_tokens(self.theme)
+        is_light = self.theme == "light"
+        self.setStyleSheet(f"""
+            ShelfItemWidget {{
+                background-color: {tok["well_bg"]};
+                border: 1px solid {tok["well_border"]};
+                border-radius: 8px;
+                font-family: {_SHELF_FONT_CSS};
+            }}
+            ShelfItemWidget:hover {{
+                background-color: {tok["well_hover_bg"]};
+                border: 1px solid rgba(59, 130, 246, 0.40);
+            }}
+        """)
+        self.lbl_name.setStyleSheet(
+            f"font-family: {_SHELF_FONT_CSS}; font-size: 12px; font-weight: 600; color: {tok['text_primary']};"
+        )
+        self.lbl_size.setStyleSheet(
+            f"font-family: {_SHELF_FONT_CSS}; font-size: 10px; color: {tok['text_muted']};"
+        )
+        self.btn_del.setIcon(_shelf_icon("close", size=14, color=tok["text_muted"], light=is_light))
         self.btn_del.setStyleSheet("""
             QPushButton {
                 background-color: transparent;
-                color: #64748b;
                 border: none;
+                padding: 0px;
                 border-radius: 11px;
-                font-size: 12px;
-                font-weight: bold;
             }
             QPushButton:hover {
-                background-color: rgba(239, 68, 68, 0.2);
-                color: #ef4444;
+                background-color: rgba(239, 68, 68, 0.16);
             }
         """)
-        self.btn_del.clicked.connect(lambda: self.removed.emit(self.item.path))
-        layout.addWidget(self.btn_del)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -350,7 +437,15 @@ class ShelfItemWidget(QFrame):
             mime.setUrls([QUrl.fromLocalFile(self.item.path)])
             drag.setMimeData(mime)
             if self.item.icon and not self.item.icon.isNull():
-                drag.setPixmap(self.item.icon.scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                dpr = max(1.0, float(self.devicePixelRatioF() or 1.0))
+                px = max(40, int(round(40 * dpr)))
+                drag_pm = self.item.icon.scaled(
+                    px, px,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                drag_pm.setDevicePixelRatio(dpr)
+                drag.setPixmap(drag_pm)
                 drag.setHotSpot(QPoint(20, 20))
             drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
         self._drag_start_pos = None
@@ -391,13 +486,17 @@ class FileShelfWindow(QWidget):
         self.pinned: bool = cfg.get("pinned", False)
         self.y_ratio: float = cfg.get("y_ratio", 0.45)
         self.hide_in_fullscreen: bool = cfg.get("hide_in_fullscreen", True)
+        self.theme: str = str(self.config_manager.get("theme", "dark") or "dark").lower()
         self.is_expanded: bool = False
 
         self._drag_all_start: Optional[QPoint] = None
         self._is_animating: bool = False
         self._game_suppressed: bool = False
+        self._is_closed: bool = False
         self._winevent_hook = None
         self._win_event_proc = None
+        self._hook_box = [None, None]
+        self._destroyed_guard_connected: bool = False
         self._suppress_timer: Optional[QTimer] = None
 
         # Window Attributes
@@ -406,7 +505,8 @@ class FileShelfWindow(QWidget):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        if parent is None:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAcceptDrops(True)
 
         self.anim = QPropertyAnimation(self, b"geometry")
@@ -414,8 +514,14 @@ class FileShelfWindow(QWidget):
         self.anim.finished.connect(self._on_anim_finished)
 
         self._init_ui()
+        self.set_theme(self.theme)
         self.update_geometry_for_state(animate=False)
         self._init_fullscreen_monitor()
+
+    def _current_theme(self) -> str:
+        if self.config_manager and hasattr(self.config_manager, "get"):
+            return str(self.config_manager.get("theme", self.theme) or "dark").lower()
+        return self.theme
 
     def _init_ui(self):
         # Master outer layout
@@ -435,20 +541,10 @@ class FileShelfWindow(QWidget):
         header = QHBoxLayout()
         header.setSpacing(6)
 
-        lbl_title = QLabel("文件中转站", self.expanded_container)
-        lbl_title.setStyleSheet("font-size: 13px; font-weight: 700; color: #ffffff;")
-        header.addWidget(lbl_title)
+        self.lbl_title = QLabel("文件中转站", self.expanded_container)
+        header.addWidget(self.lbl_title)
 
         self.lbl_badge = QLabel("0 项", self.expanded_container)
-        self.lbl_badge.setStyleSheet("""
-            background-color: rgba(59, 130, 246, 0.18);
-            color: #60a5fa;
-            font-size: 10px;
-            font-weight: 600;
-            padding: 2px 7px;
-            border-radius: 4px;
-            border: 1px solid rgba(59, 130, 246, 0.35);
-        """)
         header.addWidget(self.lbl_badge)
         header.addStretch()
 
@@ -460,24 +556,20 @@ class FileShelfWindow(QWidget):
         self.btn_pin.setToolTip("固定展开窗口 (防止自动缩进)")
         self.btn_pin.clicked.connect(self.toggle_pin)
 
-        btn_clear = QPushButton(self.expanded_container)
-        btn_clear.setToolTip("清空中转暂存 (不删除本地原文件)")
-        btn_clear.clicked.connect(self.clear_items)
+        self.btn_clear = QPushButton(self.expanded_container)
+        self.btn_clear.setToolTip("清空中转暂存 (不删除本地原文件)")
+        self.btn_clear.clicked.connect(self.clear_items)
 
-        btn_close = QPushButton(self.expanded_container)
-        btn_close.setToolTip("缩回屏幕边缘")
-        btn_close.clicked.connect(self.collapse_shelf)
+        self.btn_close = QPushButton(self.expanded_container)
+        self.btn_close.setToolTip("缩回屏幕边缘")
+        self.btn_close.clicked.connect(self.collapse_shelf)
 
-        for btn in (self.btn_pin, btn_clear, btn_close):
+        for btn in (self.btn_pin, self.btn_clear, self.btn_close):
             btn.setFixedSize(26, 26)
             btn.setIconSize(QSize(18, 18))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setStyleSheet(HEADER_BTN_QSS)
             actions.addWidget(btn)
 
-        self.btn_pin.setIcon(_shelf_icon("pin", self.pinned))
-        btn_clear.setIcon(_shelf_icon("trash"))
-        btn_close.setIcon(_shelf_icon("close"))
         header.addLayout(actions)
 
         box.addLayout(header)
@@ -488,20 +580,6 @@ class FileShelfWindow(QWidget):
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll_area.setStyleSheet("""
-            QScrollArea { background: transparent; border: none; }
-            QScrollBar:vertical {
-                border: none;
-                background: transparent;
-                width: 4px;
-                margin: 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: rgba(255, 255, 255, 0.2);
-                border-radius: 2px;
-                min-height: 20px;
-            }
-        """)
 
         self.list_container = QWidget()
         self.list_layout = QVBoxLayout(self.list_container)
@@ -509,7 +587,7 @@ class FileShelfWindow(QWidget):
         self.list_layout.setSpacing(6)
 
         # Empty State Placeholder
-        self.empty_placeholder = EmptyZone(self.list_container)
+        self.empty_placeholder = EmptyZone(self.list_container, theme=self.theme)
         self.empty_placeholder.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         empty_box = QVBoxLayout(self.empty_placeholder)
@@ -517,21 +595,18 @@ class FileShelfWindow(QWidget):
         empty_box.setSpacing(8)
         empty_box.addStretch(1)
 
-        lbl_drag_hint = QLabel(self.empty_placeholder)
-        lbl_drag_hint.setPixmap(_shelf_icon("inbox", size=40, color="#7c8ba3").pixmap(40, 40))
-        lbl_drag_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_drag_hint = QLabel(self.empty_placeholder)
+        self.lbl_drag_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_hint_title = QLabel("拖入文件暂存", self.empty_placeholder)
-        lbl_hint_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_hint_title.setStyleSheet("font-size: 12px; font-weight: 600; color: #cbd5e1;")
+        self.lbl_hint_title = QLabel("拖入文件暂存", self.empty_placeholder)
+        self.lbl_hint_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_hint_sub = QLabel("随时批量拖出或归档至大文件夹", self.empty_placeholder)
-        lbl_hint_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_hint_sub.setStyleSheet("font-size: 10px; color: #64748b;")
+        self.lbl_hint_sub = QLabel("支持多批次暂存与一键拖出", self.empty_placeholder)
+        self.lbl_hint_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        empty_box.addWidget(lbl_drag_hint)
-        empty_box.addWidget(lbl_hint_title)
-        empty_box.addWidget(lbl_hint_sub)
+        empty_box.addWidget(self.lbl_drag_hint)
+        empty_box.addWidget(self.lbl_hint_title)
+        empty_box.addWidget(self.lbl_hint_sub)
         empty_box.addStretch(1)
         self.list_layout.insertWidget(0, self.empty_placeholder)
 
@@ -543,28 +618,10 @@ class FileShelfWindow(QWidget):
         bottom_box.setSpacing(8)
 
         # Main "Drag All" button
-        self.btn_drag_all = QPushButton("全部拖出（按住拖拽至目标窗口）", self.expanded_container)
+        self.btn_drag_all = QPushButton("按住拖出全部文件", self.expanded_container)
         self.btn_drag_all.setFixedHeight(34)
         self.btn_drag_all.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.btn_drag_all.setToolTip("按住此按钮拖拽，可一次性将所有暂存文件拖入微信、邮件、浏览器或文件夹")
-        self.btn_drag_all.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #3b82f6);
-                color: #ffffff;
-                font-size: 12px;
-                font-weight: 600;
-                border-radius: 8px;
-                border: 1px solid rgba(255, 255, 255, 0.2);
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1d4ed8, stop:1 #2563eb);
-            }
-            QPushButton:disabled {
-                background: rgba(255, 255, 255, 0.05);
-                color: #64748b;
-                border: 1px solid rgba(255, 255, 255, 0.05);
-            }
-        """)
+        self.btn_drag_all.setToolTip("按住此按钮拖拽，可一次性将暂存文件拖入微信、邮件、浏览器或文件夹")
         self.btn_drag_all.setEnabled(False)
         self.btn_drag_all.installEventFilter(self)
         bottom_box.addWidget(self.btn_drag_all)
@@ -573,61 +630,162 @@ class FileShelfWindow(QWidget):
         sub_row = QHBoxLayout()
         sub_row.setSpacing(8)
 
-        btn_archive = QPushButton("归档至大文件夹 ▾", self.expanded_container)
-        btn_archive.setFixedHeight(28)
-        btn_archive.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_archive.setStyleSheet("""
-            QPushButton {
-                background: rgba(255, 255, 255, 0.06);
-                color: #e2e8f0;
-                font-size: 11px;
-                font-weight: 500;
-                border-radius: 6px;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.12);
-                border-color: rgba(96, 165, 250, 0.3);
-            }
-        """)
-        btn_archive.clicked.connect(lambda: self.show_archive_menu(btn_archive))
-        sub_row.addWidget(btn_archive, stretch=1)
+        self.btn_archive = QPushButton("归档至分类 ▾", self.expanded_container)
+        self.btn_archive.setFixedHeight(28)
+        self.btn_archive.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_archive.clicked.connect(lambda: self.show_archive_menu(self.btn_archive))
+        sub_row.addWidget(self.btn_archive, stretch=1)
 
-        btn_copy = QPushButton("复制路径", self.expanded_container)
-        btn_copy.setFixedHeight(28)
-        btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_copy.setToolTip("复制所有暂存文件的绝对路径至剪贴板")
-        btn_copy.setStyleSheet("""
-            QPushButton {
-                background: rgba(255, 255, 255, 0.06);
-                color: #94a3b8;
-                font-size: 11px;
-                border-radius: 6px;
-                border: 1px solid rgba(255, 255, 255, 0.08);
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.12);
-                color: #ffffff;
-            }
-        """)
-        btn_copy.clicked.connect(self.copy_paths)
-        sub_row.addWidget(btn_copy)
+        self.btn_copy = QPushButton("复制路径", self.expanded_container)
+        self.btn_copy.setFixedHeight(28)
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.setToolTip("复制所有暂存文件的绝对路径至剪贴板")
+        self.btn_copy.clicked.connect(self.copy_paths)
+        sub_row.addWidget(self.btn_copy)
 
         bottom_box.addLayout(sub_row)
         box.addLayout(bottom_box)
 
         self.master_layout.addWidget(self.expanded_container)
 
+        base_font = QFont()
+        base_font.setFamilies(_SHELF_FONT_FAMILIES)
+        base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+        self.setFont(base_font)
+
+    def set_theme(self, theme: str):
+        self.theme = (theme or "dark").strip().lower()
+        tok = get_theme_tokens(self.theme)
+        is_light = self.theme == "light"
+
+        self.lbl_title.setStyleSheet(
+            f"font-family: {_SHELF_FONT_CSS}; font-size: 13px; font-weight: 600; color: {tok['text_primary']};"
+        )
+        badge_border = "rgba(37, 99, 235, 0.24)" if is_light else "rgba(59, 130, 246, 0.32)"
+        self.lbl_badge.setStyleSheet(f"""
+            background-color: {tok["badge_bg"]};
+            color: {tok["badge_fg"]};
+            font-family: {_SHELF_FONT_CSS};
+            font-size: 10px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 9px;
+            border: 1px solid {badge_border};
+        """)
+
+        btn_qss = HEADER_BTN_LIGHT_QSS if is_light else HEADER_BTN_QSS
+        for btn in (self.btn_pin, self.btn_clear, self.btn_close):
+            btn.setStyleSheet(btn_qss)
+        self.btn_pin.setIcon(_shelf_icon("pin", self.pinned, light=is_light))
+        self.btn_clear.setIcon(_shelf_icon("trash", light=is_light))
+        self.btn_close.setIcon(_shelf_icon("close", light=is_light))
+
+        sb_handle = "rgba(15, 23, 42, 0.20)" if is_light else "rgba(255, 255, 255, 0.20)"
+        self.scroll_area.setStyleSheet(f"""
+            QScrollArea {{ background: transparent; border: none; font-family: {_SHELF_FONT_CSS}; }}
+            QWidget {{ background: transparent; }}
+            QScrollBar:vertical {{
+                border: none;
+                background: transparent;
+                width: 4px;
+                margin: 0px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {sb_handle};
+                border-radius: 2px;
+                min-height: 20px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+        """)
+
+        self.empty_placeholder.set_theme(self.theme)
+        inbox_color = "#64748b" if is_light else "#94a3b8"
+        self.lbl_drag_hint.setPixmap(_shelf_icon("inbox", size=36, color=inbox_color).pixmap(36, 36))
+        self.lbl_hint_title.setStyleSheet(
+            f"font-family: {_SHELF_FONT_CSS}; font-size: 12px; font-weight: 600; color: {tok['text_secondary']};"
+        )
+        self.lbl_hint_sub.setStyleSheet(
+            f"font-family: {_SHELF_FONT_CSS}; font-size: 11px; color: {tok['text_muted']};"
+        )
+
+        dis_bg = "rgba(15, 23, 42, 0.05)" if is_light else "rgba(255, 255, 255, 0.05)"
+        dis_border = "rgba(15, 23, 42, 0.08)" if is_light else "rgba(255, 255, 255, 0.06)"
+        self.btn_drag_all.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #3b82f6;
+                color: #ffffff;
+                padding: 0px 10px;
+                font-family: {_SHELF_FONT_CSS};
+                font-size: 12px;
+                font-weight: 600;
+                border-radius: 17px;
+                border: 1px solid #2563eb;
+            }}
+            QPushButton:hover {{
+                background-color: #2563eb;
+            }}
+            QPushButton:pressed {{
+                background-color: #1d4ed8;
+            }}
+            QPushButton:disabled {{
+                background-color: {dis_bg};
+                color: {tok["text_muted"]};
+                border: 1px solid {dis_border};
+            }}
+        """)
+
+        self.btn_archive.setStyleSheet(f"""
+            QPushButton {{
+                background: {tok["well_bg"]};
+                color: {tok["text_secondary"]};
+                padding: 0px 10px;
+                font-family: {_SHELF_FONT_CSS};
+                font-size: 11px;
+                font-weight: 500;
+                border-radius: 8px;
+                border: 1px solid {tok["well_border"]};
+            }}
+            QPushButton:hover {{
+                background: {tok["well_hover_bg"]};
+                border-color: rgba(59, 130, 246, 0.35);
+            }}
+        """)
+        self.btn_copy.setStyleSheet(f"""
+            QPushButton {{
+                background: {tok["well_bg"]};
+                color: {tok["text_muted"]};
+                padding: 0px 10px;
+                font-family: {_SHELF_FONT_CSS};
+                font-size: 11px;
+                font-weight: 500;
+                border-radius: 8px;
+                border: 1px solid {tok["well_border"]};
+            }}
+            QPushButton:hover {{
+                background: {tok["well_hover_bg"]};
+                color: {tok["text_primary"]};
+            }}
+        """)
+
+        for i in range(self.list_layout.count()):
+            w = self.list_layout.itemAt(i).widget()
+            if isinstance(w, ShelfItemWidget):
+                w.apply_theme(self.theme)
+        self.update()
+
     def eventFilter(self, watched, event):
         """Captures mouse press on the drag-all button to initiate batch OLE drag."""
         if watched == self.btn_drag_all:
-            if event.type() == QMouseEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self._drag_all_start = event.pos()
-            elif event.type() == QMouseEvent.Type.MouseMove and self._drag_all_start:
-                if (event.pos() - self._drag_all_start).manhattanLength() >= 6:
-                    self.start_drag_all()
+            elif etype == QEvent.Type.MouseMove and self._drag_all_start is not None:
+                if not (event.buttons() & Qt.MouseButton.LeftButton):
                     self._drag_all_start = None
-            elif event.type() == QMouseEvent.Type.MouseButtonRelease:
+                elif (event.pos() - self._drag_all_start).manhattanLength() >= 6:
+                    self._drag_all_start = None
+                    self.start_drag_all()
+            elif etype == QEvent.Type.MouseButtonRelease:
                 self._drag_all_start = None
         return super().eventFilter(watched, event)
 
@@ -637,16 +795,18 @@ class FileShelfWindow(QWidget):
 
     def get_target_geometry(self, expanded: bool) -> QRect:
         """Computes target geometry anchored to current screen edge."""
+        w = self.EXPANDED_W if expanded else self.HANDLE_W
+        h = self.EXPANDED_H if expanded else self.HANDLE_H
         screen = QApplication.primaryScreen()
         cursor_pos = QCursor.pos()
         for s in QApplication.screens():
             if s.geometry().contains(cursor_pos):
                 screen = s
                 break
+        if screen is None:
+            return QRect(0, 100, w, h)
 
         geo = screen.availableGeometry()
-        w = self.EXPANDED_W if expanded else self.HANDLE_W
-        h = self.EXPANDED_H if expanded else self.HANDLE_H
         y = geo.top() + int(geo.height() * self.y_ratio) - h // 2
         y = max(geo.top() + 10, min(y, geo.bottom() - h - 10))
 
@@ -710,7 +870,7 @@ class FileShelfWindow(QWidget):
 
     def toggle_pin(self):
         self.pinned = not self.pinned
-        self.btn_pin.setIcon(_shelf_icon("pin", self.pinned))
+        self.btn_pin.setIcon(_shelf_icon("pin", self.pinned, light=(self._current_theme() == "light")))
         cfg = self.config_manager.get_file_shelf_config()
         cfg["pinned"] = self.pinned
         self.config_manager.set_file_shelf_config(cfg)
@@ -719,15 +879,30 @@ class FileShelfWindow(QWidget):
     # Fullscreen & Game Auto-Suppression
     # =========================================================================
 
+    @property
+    def _win_event_hook(self):
+        return self._winevent_hook
+
+    @_win_event_hook.setter
+    def _win_event_hook(self, value):
+        self._winevent_hook = value
+
     def _init_fullscreen_monitor(self):
         """
         Installs lightweight EVENT_SYSTEM_FOREGROUND hook and gentle polling
         to auto-hide the file shelf handle whenever a fullscreen game or video takes focus.
         """
+        self.unhook_fullscreen_monitor()
+
         if sys.platform == "win32" and user32 and WinEventProcType:
+            self_ref = weakref.ref(self)
+
             def _on_winevent(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
                 try:
-                    self.check_fullscreen_suppression()
+                    w = self_ref()
+                    if w is None or getattr(w, "_is_closed", False):
+                        return
+                    w.check_fullscreen_suppression()
                 except Exception:
                     pass
 
@@ -744,11 +919,60 @@ class FileShelfWindow(QWidget):
                 )
             except Exception:
                 self._winevent_hook = None
+                self._win_event_proc = None
+
+            self._hook_box[0] = self._winevent_hook
+            self._hook_box[1] = self._win_event_proc
+
+            if not getattr(self, "_destroyed_guard_connected", False):
+                hook_box = self._hook_box
+
+                def _unhook_on_destroy(*_args):
+                    hk, proc = hook_box[0], hook_box[1]
+                    if hk and user32:
+                        ok = False
+                        try:
+                            ok = bool(user32.UnhookWinEvent(hk))
+                        except Exception:
+                            ok = False
+                        if not ok and proc is not None:
+                            _RETIRED_WINEVENT_PROCS.append(proc)
+                    hook_box[0] = None
+                    hook_box[1] = None
+
+                self.destroyed.connect(_unhook_on_destroy)
+                self._destroyed_guard_connected = True
 
         self._suppress_timer = QTimer(self)
         self._suppress_timer.setInterval(2000)
         self._suppress_timer.timeout.connect(self.check_fullscreen_suppression)
         self._suppress_timer.start()
+
+    def unhook_fullscreen_monitor(self):
+        """Safely unhooks WinEvent callback and stops background timers."""
+        if getattr(self, "anim", None) is not None:
+            self.anim.stop()
+        self._is_animating = False
+
+        if getattr(self, "_suppress_timer", None) is not None:
+            self._suppress_timer.stop()
+            self._suppress_timer = None
+
+        hook = getattr(self, "_winevent_hook", None)
+        proc = getattr(self, "_win_event_proc", None)
+        if hook and user32:
+            ok = False
+            try:
+                ok = bool(user32.UnhookWinEvent(hook))
+            except Exception:
+                ok = False
+            if not ok and proc is not None:
+                _RETIRED_WINEVENT_PROCS.append(proc)
+        self._winevent_hook = None
+        self._win_event_proc = None
+        if hasattr(self, "_hook_box"):
+            self._hook_box[0] = None
+            self._hook_box[1] = None
 
     def check_fullscreen_suppression(self):
         """
@@ -756,10 +980,15 @@ class FileShelfWindow(QWidget):
         When true, completely hides the edge handle to avoid obstructing gameplay/videos.
         When false, restores the edge handle immediately.
         """
+        if getattr(self, "_is_closed", False):
+            return
+
         if not getattr(self, "hide_in_fullscreen", True):
             if getattr(self, "_game_suppressed", False):
                 self._game_suppressed = False
-                self.show()
+                cfg = self.config_manager.get_file_shelf_config()
+                if cfg.get("enabled", True):
+                    self.show()
             return
 
         if not user32:
@@ -772,11 +1001,11 @@ class FileShelfWindow(QWidget):
 
             my_hwnd = 0
             try:
-                my_hwnd = int(self.winId())
+                my_hwnd = int(self.internalWinId() or 0)
             except Exception:
                 pass
 
-            if fg == my_hwnd:
+            if my_hwnd and fg == my_hwnd:
                 return
 
             is_game_or_fs = is_window_fullscreen_or_game(fg)
@@ -808,17 +1037,20 @@ class FileShelfWindow(QWidget):
             if cfg.get("enabled", True):
                 self.show()
 
+    def showEvent(self, event):
+        if getattr(self, "_is_closed", False):
+            self._is_closed = False
+            self._init_fullscreen_monitor()
+        super().showEvent(event)
+
+    def close_widget(self):
+        self._is_closed = True
+        self.unhook_fullscreen_monitor()
+        self.hide()
+
     def closeEvent(self, event):
-        if getattr(self, "_suppress_timer", None):
-            self._suppress_timer.stop()
-            self._suppress_timer = None
-        if getattr(self, "_winevent_hook", None) and user32:
-            try:
-                user32.UnhookWinEvent(self._winevent_hook)
-            except Exception:
-                pass
-            self._winevent_hook = None
-        self._win_event_proc = None
+        self._is_closed = True
+        self.unhook_fullscreen_monitor()
         super().closeEvent(event)
 
     # =========================================================================
@@ -879,8 +1111,11 @@ class FileShelfWindow(QWidget):
         self.lbl_badge.setText(f"{count} 项 · {size_str}" if count > 0 else "0 项")
 
         # Insert new widgets
+        cur_theme = self._current_theme()
+        if cur_theme != self.theme:
+            self.set_theme(cur_theme)
         for idx, item in enumerate(self.staged_items):
-            w = ShelfItemWidget(item, self.list_container)
+            w = ShelfItemWidget(item, self.list_container, theme=cur_theme)
             w.removed.connect(self.remove_path)
             self.list_layout.insertWidget(idx, w)
 
@@ -891,7 +1126,8 @@ class FileShelfWindow(QWidget):
     # =========================================================================
 
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls() or event.mimeData().hasText():
+        mime = event.mimeData()
+        if mime.hasUrls() or mime.hasText() or mime.hasFormat(STACKY_ITEM_MIME):
             event.acceptProposedAction()
             if not self.is_expanded:
                 self.expand_shelf()
@@ -899,27 +1135,48 @@ class FileShelfWindow(QWidget):
             event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent):
-        if event.mimeData().hasUrls() or event.mimeData().hasText():
+        mime = event.mimeData()
+        if mime.hasUrls() or mime.hasText() or mime.hasFormat(STACKY_ITEM_MIME):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
+        mime = event.mimeData()
+        stacky_drag_token = ""
+        stacky_item_path = ""
+        if mime.hasFormat(STACKY_ITEM_MIME):
+            try:
+                raw = bytes(mime.data(STACKY_ITEM_MIME)).decode("utf-8")
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    stacky_drag_token = str(payload.get("drag_token", "") or "")
+                    item_data = payload.get("item_data")
+                    if isinstance(item_data, dict):
+                        stacky_item_path = str(item_data.get("path", "") or "")
+            except Exception:
+                pass
+
+        urls = mime.urls()
         paths = []
         if urls:
             for u in urls:
                 p = u.toLocalFile()
                 if p and os.path.exists(p):
                     paths.append(p)
-        elif event.mimeData().hasText():
-            text = event.mimeData().text().strip()
+        elif mime.hasText():
+            text = mime.text().strip()
             for line in text.splitlines():
                 clean = line.strip().strip('"').strip("'")
-                if os.path.exists(clean):
+                if clean and os.path.exists(clean):
                     paths.append(clean)
 
+        if not paths and stacky_item_path and os.path.exists(stacky_item_path):
+            paths.append(stacky_item_path)
+
         if paths:
+            if stacky_drag_token:
+                mark_cross_folder_drop(stacky_drag_token)
             event.acceptProposedAction()
             self.add_paths(paths)
 
@@ -937,36 +1194,62 @@ class FileShelfWindow(QWidget):
         mime.setUrls(valid_urls)
         drag.setMimeData(mime)
 
-        # Drag preview thumbnail
+        # Drag preview thumbnail (hotspot uses logical coordinates)
         preview = self._create_drag_preview(len(valid_urls))
         drag.setPixmap(preview)
-        drag.setHotSpot(QPoint(preview.width() // 2, preview.height() // 2))
+        dpr = max(1.0, float(preview.devicePixelRatio() or 1.0))
+        drag.setHotSpot(QPoint(int(round(preview.width() / dpr)) // 2, int(round(preview.height() / dpr)) // 2))
 
         result = drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
 
     def _create_drag_preview(self, count: int) -> QPixmap:
         """Generates a stylish translucent card thumbnail for batch drag operation."""
         size = 140
-        img = QImage(size, 54, QImage.Format.Format_ARGB32_Premultiplied)
+        h = 54
+        dpr = max(1.0, float(self.devicePixelRatioF() or 1.0))
+        img = QImage(
+            max(1, int(round(size * dpr))),
+            max(1, int(round(h * dpr))),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        img.setDevicePixelRatio(dpr)
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
-        rect = QRectF(2, 2, size - 4, 50)
+        cur_theme = self._current_theme()
+        tok = get_theme_tokens(cur_theme)
+        is_light = cur_theme == "light"
+        rect = QRectF(2, 2, size - 4, h - 4)
         path = create_squircle_path(rect, 10)
-        p.fillPath(path, QColor(30, 41, 59, 230))
-        p.strokePath(path, QPen(QColor(96, 165, 250, 180), 1.5))
+        p.fillPath(path, QColor(248, 250, 252, 240) if is_light else QColor(30, 41, 59, 230))
+        p.strokePath(path, QPen(QColor(37, 99, 235, 175) if is_light else QColor(96, 165, 250, 180), 1.5))
 
         # First item's icon if available
-        if self.staged_items and self.staged_items[0].icon:
-            p.drawPixmap(12, 11, self.staged_items[0].icon.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if self.staged_items and self.staged_items[0].icon and not self.staged_items[0].icon.isNull():
+            icon_px = max(32, int(round(32 * dpr)))
+            icon_pm = self.staged_items[0].icon.scaled(
+                icon_px, icon_px,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            icon_pm.setDevicePixelRatio(dpr)
+            p.drawPixmap(12, 11, icon_pm)
 
-        p.setFont(QFont("Segoe UI Variable Display, Microsoft YaHei UI", 11, QFont.Weight.Bold))
-        p.setPen(QColor("#ffffff"))
+        preview_font = QFont()
+        preview_font.setFamilies(["Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI"])
+        preview_font.setPointSize(11)
+        preview_font.setWeight(QFont.Weight.DemiBold)
+        preview_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+        p.setFont(preview_font)
+        p.setPen(QColor(tok["text_primary"]))
         p.drawText(QRectF(52, 10, size - 56, 34), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"{count} 个文件")
 
         p.end()
-        return QPixmap.fromImage(img)
+        pm = QPixmap.fromImage(img)
+        pm.setDevicePixelRatio(dpr)
+        return pm
 
     # =========================================================================
     # Archiving & Utility Actions
@@ -977,26 +1260,9 @@ class FileShelfWindow(QWidget):
         if not self.staged_items:
             return
 
+        cur_theme = self._current_theme()
         menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #1e2029;
-                color: #e2e8f0;
-                border: 1px solid rgba(255, 255, 255, 0.12);
-                border-radius: 8px;
-                padding: 4px;
-                font-size: 12px;
-            }
-            QMenu::item {
-                height: 28px;
-                padding: 4px 16px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #2563eb;
-                color: #ffffff;
-            }
-        """)
+        menu.setStyleSheet(menu_qss(cur_theme))
 
         # Get Stacky categories
         folders = self.config_manager.get_folders()
@@ -1082,6 +1348,8 @@ class FileShelfWindow(QWidget):
     def _snap_after_drag(self):
         """松手后吸附到最近边缘，并把自己的纵向比例写进配置，下次原地出现。"""
         screen = (self.screen() or QApplication.primaryScreen())
+        if screen is None:
+            return
         geo = screen.availableGeometry()
         center_y = self.y() + self.height() // 2
         self.y_ratio = max(0.05, min(0.95, (center_y - geo.top()) / max(1, geo.height())))
@@ -1093,6 +1361,13 @@ class FileShelfWindow(QWidget):
         self.update_geometry_for_state(animate=False)
 
     def paintEvent(self, event):
+        cur_theme = self._current_theme()
+        if cur_theme != self.theme:
+            self.set_theme(cur_theme)
+
+        tok = get_theme_tokens(cur_theme)
+        is_light = cur_theme == "light"
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
@@ -1121,13 +1396,24 @@ class FileShelfWindow(QWidget):
                 path.closeSubpath()
 
             # Handle body
-            handle_color = QColor(22, 25, 34, 220)
+            if is_light:
+                handle_color = QColor(248, 250, 252, 236)
+                border_color = QColor(37, 99, 235, 145)
+                dot_color = QColor(51, 65, 85, 195)
+            elif cur_theme == "oled":
+                handle_color = QColor(10, 12, 16, 235)
+                border_color = QColor(59, 130, 246, 160)
+                dot_color = QColor(255, 255, 255, 180)
+            else:
+                handle_color = QColor(22, 25, 34, 220)
+                border_color = QColor(59, 130, 246, 160)
+                dot_color = QColor(255, 255, 255, 180)
             painter.fillPath(path, handle_color)
-            painter.strokePath(path, QPen(QColor(59, 130, 246, 160), 1.0))
+            painter.strokePath(path, QPen(border_color, 1.0))
 
             # Grip Dots / Chevron Indicator
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(255, 255, 255, 180))
+            painter.setBrush(dot_color)
             center_x = rect.center().x()
             center_y = rect.center().y()
             for dy in (-12, -4, 4, 12):
@@ -1137,26 +1423,32 @@ class FileShelfWindow(QWidget):
             rect = QRectF(4, 4, self.width() - 8, self.height() - 8)
             path = create_squircle_path(rect, 16)
 
-            # Deep acrylic dark glass fill
-            bg_color = QColor(18, 21, 29, 242)
-            painter.fillPath(path, bg_color)
+            grad = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.bottom())
+            c_top = QColor(tok["surface_top"])
+            c_bot = QColor(tok["surface_bottom"])
+            c_top.setAlpha(246 if is_light else 242)
+            c_bot.setAlpha(244 if is_light else 246)
+            grad.setColorAt(0.0, c_top)
+            grad.setColorAt(1.0, c_bot)
+            painter.fillPath(path, grad)
 
-            # 1px Specular highlight border
-            painter.strokePath(path, QPen(QColor(255, 255, 255, 35), 1.0))
+            # 1px Specular highlight / slate hairline border
+            border_c = QColor(15, 23, 42, 32) if is_light else QColor(255, 255, 255, 38)
+            painter.strokePath(path, QPen(border_c, 1.0))
 
             # Ambient inner glow
             radial = QRadialGradient(rect.center().x(), rect.top(), rect.width() * 0.8)
-            radial.setColorAt(0.0, QColor(59, 130, 246, 25))
+            radial.setColorAt(0.0, QColor(59, 130, 246, 18 if is_light else 25))
             radial.setColorAt(1.0, QColor(0, 0, 0, 0))
             painter.fillPath(path, radial)
 
             # 顶部高光 + 标题栏分隔线：让面板有层次，不再是一块纯色
             sheen = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.top() + 60)
-            sheen.setColorAt(0.0, QColor(255, 255, 255, 26))
+            sheen.setColorAt(0.0, QColor(255, 255, 255, 150 if is_light else 26))
             sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
             painter.fillPath(path, sheen)
-            painter.setPen(QPen(QColor(255, 255, 255, 22), 1))
+            div_c = QColor(15, 23, 42, 20) if is_light else QColor(255, 255, 255, 22)
+            painter.setPen(QPen(div_c, 1))
             painter.drawLine(int(rect.left()) + 12, 54, int(rect.right()) - 12, 54)
-
 
         painter.end()

@@ -5,8 +5,8 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject, QSize, QRect, QEvent, QPoint
-from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics
+from PySide6.QtCore import Qt, QTimer, Signal, Slot, QObject, QSize, QRect, QRectF, QEvent, QPoint, QPointF
+from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPixmap, QIcon, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLineEdit, QListWidget,
     QListWidgetItem, QMenu, QStyledItemDelegate, QStyle,
@@ -15,16 +15,46 @@ from PySide6.QtWidgets import (
 from desktop_widgets import (
     BaseDesktopWidgetWindow, CARD_W_2X2, CARD_H_2X2,
     CARD_W_2X1, CARD_H_2X1, MARGIN_SHADOW, finish_widget_menu,
+    _get_widget_menu_qss,
 )
 from icon_utils import create_squircle_path, draw_liquid_glass
 import search_utils
 
+_UI_FONT_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI"]
+_UI_FONT_CSS = '"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif'
+
 _HINTS = {
-    "idle": "输入 2 个字开始搜索",
-    "empty": "无匹配结果",
-    "unavailable": "Everything 未运行或 IPC 无响应",
-    "error": "检索异常，详见 %TEMP%\\stacky_search.log",
+    "idle": "输入关键词搜索文件",
+    "empty": "未找到匹配文件",
+    "unavailable": "请先启动 Everything 服务",
+    "error": "搜索暂时不可用",
 }
+
+
+def _ew_font(pixel_size: int, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    f = QFont()
+    f.setFamilies(_UI_FONT_FAMILIES)
+    f.setPixelSize(max(9, int(pixel_size)))
+    f.setWeight(weight)
+    f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+    return f
+
+
+def _make_search_icon(light: bool = False) -> QIcon:
+    """自绘 14x14 抗锯齿矢量放大镜图标（2x HiDPI 采样），随深浅主题自适应着色。"""
+    pm = QPixmap(28, 28)
+    pm.setDevicePixelRatio(2.0)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    tint = QColor("#64748b") if light else QColor("#94a3b8")
+    pen = QPen(tint, 1.45, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(QRectF(2.2, 2.2, 7.4, 7.4))
+    p.drawLine(QPointF(8.5, 8.5), QPointF(11.9, 11.9))
+    p.end()
+    return QIcon(pm)
 
 
 def _everything_available() -> bool:
@@ -50,7 +80,7 @@ class _ResultDelegate(QStyledItemDelegate):
         return getattr(self.owner, "_responsive_scale", lambda: 1.0)()
 
     def sizeHint(self, option, index):
-        base = 22 if self.owner._compact else 34
+        base = 24 if self.owner._compact else 36
         return QSize(0, max(20, int(base * self._scale())))
 
     def paint(self, painter, option, index):
@@ -60,11 +90,19 @@ class _ResultDelegate(QStyledItemDelegate):
             return
 
         painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
         r = option.rect
+        pill_rect = QRectF(r.adjusted(3, 1, -3, -1))
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(r, QColor(59, 130, 246, 55))
+            path = QPainterPath()
+            path.addRoundedRect(pill_rect, 7.0, 7.0)
+            painter.fillPath(path, QColor(59, 130, 246, 48))
         elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(r, QColor(128, 128, 128, 22))
+            path = QPainterPath()
+            path.addRoundedRect(pill_rect, 7.0, 7.0)
+            painter.fillPath(path, QColor(148, 163, 184, 24))
 
         colors = self.owner._colors
         name = data.get("name", "") or ""
@@ -73,17 +111,15 @@ class _ResultDelegate(QStyledItemDelegate):
 
         s = self._scale()
         # 字号设下限：缩放到 0.5 时 9px 会小到不可读
-        name_font = QFont()
-        name_font.setPixelSize(max(11, int((11 if compact else 13) * s)))
-        dir_font = QFont()
-        dir_font.setPixelSize(max(9, int((9 if compact else 10) * s)))
+        name_font = _ew_font(max(11, int((11 if compact else 13) * s)), QFont.Weight.Medium)
+        dir_font = _ew_font(max(9, int((9 if compact else 10) * s)), QFont.Weight.Normal)
 
         painter.setPen(QColor(colors["name"]))
         painter.setFont(name_font)
         if compact:
             nw = int(r.width() * 0.55)
-            nr = QRect(r.left() + 6, r.top(), nw - 8, r.height())
-            dr = QRect(r.left() + nw, r.top(), r.width() - nw - 6, r.height())
+            nr = QRect(r.left() + 9, r.top(), nw - 11, r.height())
+            dr = QRect(r.left() + nw, r.top(), r.width() - nw - 9, r.height())
             align = Qt.AlignmentFlag.AlignVCenter
             painter.drawText(nr, align | Qt.AlignmentFlag.AlignLeft,
                              QFontMetrics(name_font).elidedText(name, Qt.TextElideMode.ElideMiddle, nr.width()))
@@ -92,8 +128,8 @@ class _ResultDelegate(QStyledItemDelegate):
             painter.drawText(dr, align | Qt.AlignmentFlag.AlignRight,
                              QFontMetrics(dir_font).elidedText(dirp, Qt.TextElideMode.ElideMiddle, dr.width()))
         else:
-            nr = QRect(r.left() + 8, r.top() + 2, r.width() - 16, r.height() // 2)
-            dr = QRect(r.left() + 8, r.top() + r.height() // 2, r.width() - 16, r.height() // 2)
+            nr = QRect(r.left() + 10, r.top() + 2, r.width() - 20, r.height() // 2)
+            dr = QRect(r.left() + 10, r.top() + r.height() // 2, r.width() - 20, r.height() // 2 - 1)
             painter.drawText(nr, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                              QFontMetrics(name_font).elidedText(name, Qt.TextElideMode.ElideMiddle, nr.width()))
             painter.setPen(QColor(colors["dir"]))
@@ -109,8 +145,9 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
     size_changed = Signal(str)
 
     def __init__(self, config_manager=None, parent=None):
-        super().__init__(CARD_W_2X2, CARD_H_2X2, parent)
+        super().__init__(CARD_W_2X2, CARD_H_2X2, parent, config_manager=config_manager)
         self.config_manager = config_manager
+        self._sync_glass_from_config()
         self.mode = self._read_size_mode(config_manager)
         self._compact = self.mode == "2x1"
         self.max_results = 4 if self._compact else 12
@@ -127,6 +164,7 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
         self._signals = _QuerySignals()
         self._signals.finished.connect(self._on_query_finished, Qt.ConnectionType.QueuedConnection)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="EverythingWidget")
+        self._executor_shutdown = False
 
         self._init_ui()
 
@@ -155,7 +193,11 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
         self.root_layout = QVBoxLayout(self.content_widget)
 
         self.search_edit = QLineEdit(self.content_widget)
-        self.search_edit.setPlaceholderText("搜索全盘文件")
+        self.search_edit.setPlaceholderText("搜索全盘文件…")
+        self._search_action = self.search_edit.addAction(
+            _make_search_icon(self.theme == "light"),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
         self.search_edit.textChanged.connect(self._on_text_changed)
         self.search_edit.returnPressed.connect(self._on_return_pressed)
         self.root_layout.addWidget(self.search_edit)
@@ -204,8 +246,15 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
                 self._snap_target = None
                 # 让 5s 巡检知道用户正在拖，别在拖动中途把窗口搬走
                 self._dragging = True
+                self._drag_watch.start()
                 return False          # 交给子控件，保留选中/双击
             if kind == QEvent.Type.MouseMove and getattr(self, "_child_dragging", False):
+                if not (event.buttons() & Qt.MouseButton.LeftButton):
+                    self._child_dragging = False
+                    self._dragging = False
+                    self._drag_watch.stop()
+                    self._snap_hide()
+                    return False
                 if getattr(self, "locked", False):
                     return False
                 delta = event.globalPosition().toPoint() - self._child_drag_origin
@@ -217,6 +266,7 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
             if kind == QEvent.Type.MouseButtonRelease and getattr(self, "_child_dragging", False):
                 self._child_dragging = False
                 self._dragging = False
+                self._drag_watch.stop()
                 if self.pos() != self._child_drag_win:
                     self._snap_commit()
                     self._user_moved_at = time.monotonic()
@@ -225,6 +275,12 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
                 self.position_changed.emit(self.x(), self.y())
                 return False
         return super().eventFilter(obj, event)
+
+    def _check_drag_released(self):
+        was_child_dragging = getattr(self, "_child_dragging", False)
+        super()._check_drag_released()
+        if was_child_dragging and not self._dragging:
+            self._child_dragging = False
 
     def on_card_resized(self):
         super().on_card_resized()
@@ -242,9 +298,13 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
 
     def _rebuild_layout(self):
         self.content_widget.setGeometry(MARGIN_SHADOW, MARGIN_SHADOW, self.card_w, self.card_h)
+        sp = 4 if self._compact else 6
         self.root_layout.setContentsMargins(14, 12, 14, 12)
-        self.root_layout.setSpacing(4 if self._compact else 6)
+        self.root_layout.setSpacing(sp)
+        self.root_layout._resp_layout_base = ((14, 12, 14, 12), sp)
         self.search_edit.setFixedHeight(26 if self._compact else 30)
+        if hasattr(self.search_edit, "_resp_base"):
+            delattr(self.search_edit, "_resp_base")
         self._apply_styles()
         self._rerender()
 
@@ -266,44 +326,39 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
     def set_theme(self, theme: str):
         super().set_theme(theme)
         self._apply_styles()
+        if hasattr(self.search_edit, "_resp_base"):
+            delattr(self.search_edit, "_resp_base")
         self._rerender()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        path = create_squircle_path(self.get_card_rect(), self.radius)
-        if self.theme == "light":
-            fill, pen = QColor(250, 250, 252, 208), QColor(255, 255, 255, 90)
-        elif self.theme == "oled":
-            fill, pen = QColor(10, 11, 14, 200), QColor(255, 255, 255, 34)
-        else:
-            fill, pen = QColor(24, 27, 36, 208), QColor(255, 255, 255, 46)
-        painter.fillPath(path, fill)
-        draw_liquid_glass(painter, path, self.get_card_rect(), self.radius, self.theme)
 
     def _apply_styles(self):
         light = self.theme == "light"
         self._colors = {
             "name": "#0f172a" if light else "#f8fafc",
-            "dir": "#475569" if light else "#a8b6c8",
-            "hint": "#334155" if light else "#e2e8f0",
+            "dir": "#64748b" if light else "#94a3b8",
+            "hint": "#64748b" if light else "#94a3b8",
         }
-        edit_bg = "rgba(255,255,255,0.90)" if light else "rgba(255,255,255,0.13)"
+        if hasattr(self, "_search_action") and self._search_action is not None:
+            self._search_action.setIcon(_make_search_icon(light))
+        edit_bg = "rgba(255, 255, 255, 0.88)" if light else "rgba(255, 255, 255, 0.09)"
         edit_fg = "#0f172a" if light else "#f8fafc"
-        edit_border = "rgba(0,0,0,0.12)" if light else "rgba(255,255,255,0.22)"
+        edit_border = "rgba(15, 23, 42, 0.12)" if light else "rgba(255, 255, 255, 0.16)"
         placeholder = "#64748b" if light else "#94a3b8"
+        sb_handle = "rgba(15, 23, 42, 0.22)" if light else "rgba(255, 255, 255, 0.24)"
         self.search_edit.setStyleSheet(
             f"QLineEdit {{ background-color: {edit_bg}; color: {edit_fg};"
-            f" border: 1px solid {edit_border}; border-radius: 10px;"
-            f" padding: 0 12px; font-size: 13px; selection-background-color: #3b82f6; }}"
+            f" border: 1px solid {edit_border}; border-radius: 9px;"
+            f" padding: 0 10px 0 4px; font-family: {_UI_FONT_CSS}; font-size: 13px;"
+            f" selection-background-color: #3b82f6; selection-color: #ffffff; }}"
             f" QLineEdit:focus {{ border: 1px solid #3b82f6; }}"
             f" QLineEdit::placeholder {{ color: {placeholder}; }}"
         )
         self.list_widget.setStyleSheet(
-            "QListWidget { background: transparent; border: none; padding: 1px 0; }"
+            f"QListWidget {{ background: transparent; border: none; padding: 2px 0;"
+            f" font-family: {_UI_FONT_CSS}; outline: none; }}"
             "QListWidget::item { background: transparent; border: none; }"
-            "QScrollBar:vertical { width: 4px; background: transparent; }"
-            "QScrollBar::handle:vertical { background: rgba(128,128,128,0.35); border-radius: 2px; }"
+            "QScrollBar:vertical { width: 4px; background: transparent; margin: 2px 0; }"
+            f"QScrollBar::handle:vertical {{ background: {sb_handle}; border-radius: 2px; min-height: 18px; }}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
         )
 
     def _render(self, status, items):
@@ -314,6 +369,7 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
             hint = QListWidgetItem(_HINTS[status])
             hint.setFlags(Qt.ItemFlag.NoItemFlags)
             hint.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            hint.setFont(_ew_font(12, QFont.Weight.Normal))
             hint.setForeground(QBrush(QColor(self._colors["hint"])))
             self.list_widget.addItem(hint)
             return
@@ -336,6 +392,8 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
         self.debounce_timer.start(40)
 
     def _trigger_query(self):
+        if getattr(self, "_executor_shutdown", False):
+            return
         query = self.search_edit.text().strip()
         if len(query) < 2:
             return
@@ -350,9 +408,15 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
                 status = "ok" if res else ("unavailable" if not _everything_available() else "empty")
             except Exception:
                 res, status = [], "error"
-            signals.finished.emit(seq, status, res)
+            try:
+                signals.finished.emit(seq, status, res)
+            except RuntimeError:
+                pass
 
-        self._executor.submit(task)
+        try:
+            self._executor.submit(task)
+        except RuntimeError:
+            pass
 
     @Slot(int, str, object)
     def _on_query_finished(self, seq, status, items):
@@ -409,12 +473,7 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
     def _on_context_menu(self, pos, global_pos=None):
         data = self._item_data(self.list_widget.itemAt(pos))
         menu = QMenu(self.list_widget)
-        menu.setStyleSheet(
-            "QMenu { background-color: #1e212b; color: #f1f5f9;"
-            " border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 4px; }"
-            " QMenu::item { padding: 6px 18px; border-radius: 6px; }"
-            " QMenu::item:selected { background-color: rgba(255,255,255,0.12); }"
-        )
+        menu.setStyleSheet(_get_widget_menu_qss(self.theme))
         act_copy = act_folder = None
         if data is not None:
             menu.addSeparator()
@@ -436,7 +495,40 @@ class EverythingWidgetWindow(BaseDesktopWidgetWindow):
         self._on_context_menu(QPoint(-1, -1), self.mapToGlobal(event.pos()))
         event.accept()
 
+    def _cleanup_resources(self):
+        self._query_seq += 1
+        if hasattr(self, "debounce_timer") and self.debounce_timer is not None:
+            self.debounce_timer.stop()
+        if not getattr(self, "_executor_shutdown", False):
+            self._executor_shutdown = True
+            try:
+                self._signals.finished.disconnect(self._on_query_finished)
+            except Exception:
+                pass
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
+        self._child_dragging = False
+        super()._cleanup_resources()
+
+    def showEvent(self, event):
+        if getattr(self, "_executor_shutdown", False):
+            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="EverythingWidget")
+            try:
+                self._signals.finished.disconnect(self._on_query_finished)
+            except Exception:
+                pass
+            self._signals.finished.connect(self._on_query_finished, Qt.ConnectionType.QueuedConnection)
+            self._executor_shutdown = False
+        super().showEvent(event)
+
     def close_widget(self):
-        self.debounce_timer.stop()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._cleanup_resources()
         super().close_widget()
+
+    def closeEvent(self, event):
+        self._cleanup_resources()
+        super().closeEvent(event)

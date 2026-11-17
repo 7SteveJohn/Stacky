@@ -20,6 +20,8 @@ a = Analysis(
         'weather_service',
         'weather_widget',
         'desktop_widgets',
+        'everything_widget',
+        'layout_scale',
         'media_service',
         'player_seek',
         'uiautomation',

@@ -15,6 +15,22 @@ from PySide6.QtCore import QPoint, QRect, QSize
 _desktop_icon_zone_cache = {"key": None, "value": None, "ts": 0.0}
 
 
+def _is_primary_monitor_geometry(avail_geo: Optional[QRect]) -> bool:
+    """Returns True when avail_geo belongs to the primary monitor (where native desktop icons live)."""
+    if avail_geo is None:
+        return True
+    try:
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        primary = app.primaryScreen() if app is not None else None
+        if primary is None:
+            return avail_geo.x() == 0
+        p_geo = primary.geometry()
+        return p_geo.intersects(avail_geo) or avail_geo.x() == p_geo.x()
+    except Exception:
+        return avail_geo.x() == 0
+
+
 def get_desktop_icons_exclusion_rect(available_geometry: Optional[QRect] = None) -> Optional[QRect]:
     """桌面图标预留区。拖拽时每次 mouseMove 会调用两次，用 1s TTL 缓存避免反复扫盘。"""
     import time
@@ -151,7 +167,7 @@ def calculate_magnetic_snap(
         safe_right = scr_right - margin_right
 
     # Primary desktop icon exclusion: cards must NEVER snap or be placed into native icons area
-    icon_zone = get_desktop_icons_exclusion_rect(available_geometry)
+    icon_zone = get_desktop_icons_exclusion_rect(available_geometry) if _is_primary_monitor_geometry(available_geometry) else None
     if icon_zone and not icon_zone.isEmpty():
         if scr_left <= icon_zone.x() < scr_right:
             safe_left = max(safe_left, icon_zone.x() + icon_zone.width() + card_gap)
@@ -384,8 +400,8 @@ def resolve_card_collision(
     safe_right = available_geometry.x() + available_geometry.width() - 8
     safe_bottom = available_geometry.y() + available_geometry.height() - 8
 
-    # Prevent overlap with desktop shortcuts zone
-    icon_zone = get_desktop_icons_exclusion_rect(available_geometry)
+    # Prevent overlap with desktop shortcuts zone (primary monitor only)
+    icon_zone = get_desktop_icons_exclusion_rect(available_geometry) if _is_primary_monitor_geometry(available_geometry) else None
     if icon_zone and not icon_zone.isEmpty():
         if not any(o == icon_zone for o in other_rects):
             other_rects.append(icon_zone)
@@ -452,4 +468,9 @@ def resolve_card_collision(
 
     bottommost = max(o.y() + o.height() for o in other_rects)
     return QPoint(target_rect.left(), bottommost + card_gap)
+
+
+import sys as _sys
+_sys.modules.setdefault("grid_snap", _sys.modules[__name__])
+_sys.modules.setdefault("stacky.core.grid_snap", _sys.modules[__name__])
 

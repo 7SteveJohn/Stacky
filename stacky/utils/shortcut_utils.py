@@ -10,7 +10,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, QByteArray, QBuffer
 
-from icon_utils import create_squircle_path, resolve_icon_location_for_path
+from icon_utils import create_squircle_path, resolve_icon_location_for_path, get_default_icon_cache_dir
 
 def generate_squircle_app_icon(output_ico_path: str) -> str:
     """
@@ -254,13 +254,12 @@ def ensure_high_res_app_icon(project_dir: str = None, force: bool = False) -> st
     """
     Ensures a valid high-resolution Stacky squircle icon exists in .cache_icons/app_icon.ico.
     """
-    if not project_dir:
-        if getattr(sys, "frozen", False):
-            project_dir = os.path.dirname(os.path.abspath(sys.executable))
-        else:
-            project_dir = ROOT
-    icon_path = os.path.join(project_dir, ".cache_icons", "app_icon.ico")
-    png_path = os.path.join(project_dir, ".cache_icons", "app_icon.png")
+    if project_dir:
+        cache_dir = os.path.join(project_dir, ".cache_icons")
+    else:
+        cache_dir = get_default_icon_cache_dir()
+    icon_path = os.path.join(cache_dir, "app_icon.ico")
+    png_path = os.path.join(cache_dir, "app_icon.png")
     if force or not os.path.exists(icon_path) or not os.path.exists(png_path) or os.path.getsize(icon_path) < 10000:
         generate_squircle_app_icon(icon_path)
     return icon_path
@@ -271,7 +270,7 @@ def create_shortcut_file(
     args: str = "",
     working_dir: str = "",
     icon_location: str = "",
-    description: str = "Stacky 灵叠 - 现代化桌面灵动空间与大文件夹组织器"
+    description: str = "Stacky 灵叠"
 ) -> bool:
     """
     Creates or rewrites a Windows .lnk shortcut using WScript.Shell COM object.
@@ -311,8 +310,8 @@ def get_desktop_dir() -> str:
     try:
         import ctypes
         buf = ctypes.create_unicode_buffer(260)
-        # CSIDL_DESKTOPDIRECTORY = 0x0000
-        if ctypes.windll.shell32.SHGetFolderPathW(None, 0, None, 0, buf) == 0:
+        # CSIDL_DESKTOPDIRECTORY = 0x0010
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:
             if buf.value and os.path.exists(buf.value):
                 return buf.value
     except Exception:
@@ -435,7 +434,7 @@ def generate_mydock_shortcut(
         args=arguments,
         working_dir=working_dir,
         icon_location=icon_path,
-        description="Stacky 灵叠 (拖入 Dock 点击直接唤醒)"
+        description="Stacky 灵叠"
     )
 
     # Create / update Desktop .lnk
@@ -448,8 +447,12 @@ def generate_mydock_shortcut(
             args=desktop_args,
             working_dir=working_dir,
             icon_location=icon_path,
-            description="Stacky 灵叠 · 现代桌面视窗矩阵与流体启动台"
+            description="Stacky 灵叠"
         )
 
     refresh_windows_icon_cache()
     return output_project_lnk
+
+
+sys.modules.setdefault("shortcut_utils", sys.modules[__name__])
+sys.modules.setdefault("stacky.utils.shortcut_utils", sys.modules[__name__])

@@ -3,17 +3,41 @@ weather_service.py - 实时气象服务引擎
 基于 Open-Meteo 公开免 Key 规范接口与 IP 自动定位，提供精准的天气数据获取与本地离线缓存。
 完全非阻塞后台线程池调度，零网络卡顿。
 """
-from stacky.paths import ROOT
+from stacky.paths import ROOT, get_user_data_dir
 
 import json
 import os
 import ssl
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from typing import Dict, Any, Optional
 from PySide6.QtCore import QObject, Signal
+
+
+def _is_ssl_verify_error(exc: BaseException) -> bool:
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, urllib.error.URLError) and isinstance(getattr(exc, "reason", None), ssl.SSLError):
+        return True
+    if isinstance(getattr(exc, "__cause__", None), ssl.SSLError):
+        return True
+    return False
+
+
+def _urlopen_resilient(req, timeout: float = 8):
+    """优先走系统标准 SSL 证书校验；仅在证书握手异常（如企业网关自签证书拦截）时回退免校验上下文。"""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except Exception as exc:
+        if not _is_ssl_verify_error(exc):
+            raise
+        fallback_ctx = ssl.create_default_context()
+        fallback_ctx.check_hostname = False
+        fallback_ctx.verify_mode = ssl.CERT_NONE
+        return urllib.request.urlopen(req, timeout=timeout, context=fallback_ctx)
 
 # 常用城市经纬度与省份字典
 POPULAR_CITIES: Dict[str, Dict[str, Any]] = {
@@ -59,7 +83,7 @@ POPULAR_CITIES: Dict[str, Dict[str, Any]] = {
     "台北": {"region": "台湾", "lat": 25.0330, "lon": 121.5654},
 }
 
-GEO_CACHE_FILE = os.path.join(ROOT, ".weather_geo.json")
+GEO_CACHE_FILE = os.path.join(get_user_data_dir(), ".weather_geo.json")
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -69,7 +93,28 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * 6371.0 * asin(sqrt(a))
 
 
-AREAS_CACHE_FILE = os.path.join(ROOT, ".weather_areas.json")
+AREAS_CACHE_FILE = os.path.join(get_user_data_dir(), ".weather_areas.json")
+_CACHE_IO_LOCK = threading.RLock()
+
+
+def _atomic_write_json(path: str, payload: Any):
+    with _CACHE_IO_LOCK:
+        tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            parent = os.path.dirname(os.path.abspath(path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 def _load_areas_cache() -> Dict[str, Any]:
@@ -81,21 +126,14 @@ def _load_areas_cache() -> Dict[str, Any]:
 
 
 def _save_areas_cache(cache: Dict[str, Any]):
-    try:
-        with open(AREAS_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False)
-    except Exception:
-        pass
+    _atomic_write_json(AREAS_CACHE_FILE, cache)
 
 
-def _datav_areas(adcode: int) -> list:
+def _datav_areas(adcode: int, timeout: float = 8) -> list:
     """阿里 DataV 公开行政区划：返回该 adcode 下一级要素（name/adcode/center）。"""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     url = f"https://geo.datav.aliyun.com/areas_v3/bound/{adcode}_full.json"
     req = urllib.request.Request(url, headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-    with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+    with _urlopen_resilient(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     out = []
     for feat in data.get("features", []):
@@ -117,7 +155,7 @@ def _datav_areas(adcode: int) -> list:
     return out
 
 
-CITY_INDEX_FILE = os.path.join(ROOT, ".weather_cities.json")
+CITY_INDEX_FILE = os.path.join(get_user_data_dir(), ".weather_cities.json")
 _city_index_building = False
 _city_index_lock = threading.Lock()
 
@@ -137,7 +175,7 @@ def _normalize_city(name: str) -> str:
 
 
 def build_city_index(force: bool = False) -> list:
-    """抓一次全国「省→市」索引并落盘缓存，供任意城市名解析使用（约 34 个请求，只跑一次）。"""
+    """抓一次全国「省→市」索引并落盘缓存，供任意城市名解析使用（带快失败预算，离线绝不卡死）。"""
     global _city_index_building
     with _city_index_lock:
         if _city_index_building:
@@ -147,10 +185,24 @@ def build_city_index(force: bool = False) -> list:
             return cached
         _city_index_building = True
     try:
+        start_ts = time.monotonic()
+        failures = 0
+        aborted = False
+        max_failures = 3
+        max_elapsed_sec = 8.0
+
+        try:
+            provinces = _datav_areas(100000, timeout=4)
+        except Exception:
+            return []
+
         cities = []
-        for prov in _datav_areas(100000):
+        for prov in provinces:
+            if failures >= max_failures or (time.monotonic() - start_ts) > max_elapsed_sec:
+                aborted = True
+                break
             try:
-                for city in _datav_areas(int(prov["adcode"])):
+                for city in _datav_areas(int(prov["adcode"]), timeout=4):
                     cities.append({
                         "name": city["name"],
                         "adcode": city.get("adcode"),
@@ -159,8 +211,12 @@ def build_city_index(force: bool = False) -> list:
                         "province": prov["name"],
                     })
             except Exception:
+                failures += 1
+                if failures >= max_failures or (time.monotonic() - start_ts) > max_elapsed_sec:
+                    aborted = True
+                    break
                 continue
-        if cities:
+        if cities and not aborted:
             try:
                 with open(CITY_INDEX_FILE, "w", encoding="utf-8") as f:
                     json.dump({"cities": cities, "ts": time.time()}, f, ensure_ascii=False)
@@ -175,10 +231,7 @@ def build_city_index(force: bool = False) -> list:
 def lookup_city_in_index(city_name: str) -> Optional[Dict[str, Any]]:
     cities = _load_city_index()
     if not cities:
-        # 首次用到时同步建一次索引（约 2s），之后全部走缓存
-        cities = build_city_index()
-    if not cities:
-        # 首次用到时同步建一次索引（约 2s），之后全部走缓存
+        # 首次用到时同步建一次索引（快失败预算保护），之后全部走缓存
         cities = build_city_index()
     if not cities:
         return None
@@ -207,13 +260,10 @@ def search_places(query: str, near_city: str = "", near_region: str = "") -> lis
     query = (query or "").strip()
     if not query:
         return []
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     q = f"{query} {near_city}".strip() if near_city and near_city not in query else query
     url = f"https://photon.komoot.io/api/?q={urllib.parse.quote(q)}&limit=8"
     req = urllib.request.Request(url, headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+    with _urlopen_resilient(req, timeout=8) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
     region_key = (near_region or "").replace("省", "").replace("市", "")
@@ -305,10 +355,7 @@ def resolve_city_coordinates(city_name: str) -> Optional[Dict[str, Any]]:
         quoted = urllib.parse.quote(raw)
         url = f"https://geocoding-api.open-meteo.com/v1/search?name={quoted}&count=1&language=zh"
         req = urllib.request.Request(url, headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with urllib.request.urlopen(req, timeout=4, context=ctx) as resp:
+        with _urlopen_resilient(req, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             results = data.get("results", []) or []
             # 重名地点很多（"昆山"可能是成都一个村，也可能是江苏昆山市）：
@@ -369,16 +416,39 @@ class WeatherService(QObject):
     weather_updated = Signal(dict)
     weather_failed = Signal(str)
 
-    CACHE_FILE = os.path.join(ROOT, ".weather_cache.json")
+    CACHE_FILE = os.path.join(get_user_data_dir(), ".weather_cache.json")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last_data: Optional[Dict[str, Any]] = None
         self._is_updating: bool = False
+        self._shutting_down: bool = False
         self._lock = threading.Lock()
         self.custom_location: Optional[Dict[str, Any]] = None
         self.preferred_district: Optional[Dict[str, Any]] = None
         self._load_cache()
+
+    def shutdown(self):
+        """标记服务停机，防止退出阶段后台守护线程向已销毁 QObject 发射信号。"""
+        self._shutting_down = True
+
+    stop = shutdown
+
+    def _safe_emit_updated(self, payload: Dict[str, Any]):
+        if self._shutting_down:
+            return
+        try:
+            self.weather_updated.emit(payload)
+        except RuntimeError:
+            pass
+
+    def _safe_emit_failed(self, err_msg: str):
+        if self._shutting_down:
+            return
+        try:
+            self.weather_failed.emit(err_msg)
+        except RuntimeError:
+            pass
 
     def set_custom_location(
         self,
@@ -446,11 +516,7 @@ class WeatherService(QObject):
                 pass
 
     def _save_cache(self, data: Dict[str, Any]):
-        try:
-            with open(self.CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        _atomic_write_json(self.CACHE_FILE, data)
 
     def get_cached_data(self) -> Dict[str, Any]:
         """获取当前缓存的气象数据（若无缓存返回自愈初始态）"""
@@ -482,17 +548,26 @@ class WeatherService(QObject):
 
     def fetch_async(self, force: bool = False):
         """异步拉取最新天气 (带 15 分钟节流防刷)"""
-        if self._is_updating:
+        if self._shutting_down:
             return
 
         now = time.time()
         if not force and self._last_data:
             last_ts = self._last_data.get("_timestamp", 0)
             if (now - last_ts) < 900:  # 15 分钟以内直接复用缓存
-                self.weather_updated.emit(self._last_data)
+                self._safe_emit_updated(self._last_data)
                 return
 
-        threading.Thread(target=self._worker_fetch, daemon=True).start()
+        with self._lock:
+            if self._is_updating:
+                return
+            self._is_updating = True
+
+        try:
+            threading.Thread(target=self._worker_fetch, daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._is_updating = False
 
     def _load_geo(self):
         try:
@@ -505,11 +580,7 @@ class WeatherService(QObject):
         return None
 
     def _save_geo(self, geo: Dict[str, Any]):
-        try:
-            with open(GEO_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(geo, f, ensure_ascii=False)
-        except Exception:
-            pass
+        _atomic_write_json(GEO_CACHE_FILE, geo)
 
     def resolve_ip_location(self, force: bool = False) -> Optional[Dict[str, Any]]:
         """按实时 IP 定位；代理/异地出口会被拒，回退到上次可信位置。
@@ -524,7 +595,7 @@ class WeatherService(QObject):
             req = urllib.request.Request(
                 "http://ip-api.com/json/?lang=zh-CN&fields=status,country,regionName,city,lat,lon,isp,query",
                 headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _urlopen_resilient(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception:
             return prev
@@ -558,10 +629,6 @@ class WeatherService(QObject):
     def _worker_fetch(self):
         with self._lock:
             self._is_updating = True
-
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
 
         # 1. 确定经纬度与城市名称
         if self.custom_location and self.custom_location.get("city"):
@@ -609,7 +676,7 @@ class WeatherService(QObject):
                                  ("best_match", f"https://api.open-meteo.com/v1/forecast?{common}")):
             try:
                 req = urllib.request.Request(candidate, headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-                with urllib.request.urlopen(req, timeout=6, context=ctx) as resp:
+                with _urlopen_resilient(req, timeout=6) as resp:
                     raw_weather = json.loads(resp.read().decode("utf-8"))
                 used_model = model
                 break
@@ -617,7 +684,7 @@ class WeatherService(QObject):
                 last_err = exc
         if raw_weather is None:
             # 上游 503/超时属于常态：保留上次数据，不要把异常抛到线程外
-            self.weather_failed.emit(str(last_err or "weather fetch failed"))
+            self._safe_emit_failed(str(last_err or "weather fetch failed"))
             with self._lock:
                 self._is_updating = False
             return
@@ -686,7 +753,7 @@ class WeatherService(QObject):
                                    f"&hourly=precipitation_probability&daily=uv_index_max,precipitation_probability_max"
                                    f"&timezone=auto&forecast_days=3&forecast_hours=12")
                         sup_req = urllib.request.Request(sup_url, headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-                        with urllib.request.urlopen(sup_req, timeout=5, context=ctx) as sup_resp:
+                        with _urlopen_resilient(sup_req, timeout=5) as sup_resp:
                             sup = json.loads(sup_resp.read().decode("utf-8"))
                         sup_hourly = sup.get("hourly", {})
                         sup_prob = sup_hourly.get("precipitation_probability") or []
@@ -713,7 +780,7 @@ class WeatherService(QObject):
                     aq_url = (f"https://air-quality-api.open-meteo.com/v1/air-quality?"
                               f"latitude={lat}&longitude={lon}&current=us_aqi&timezone=auto")
                     aq_req = urllib.request.Request(aq_url, headers={"User-Agent": "BigFolderLauncher-Weather/2.4"})
-                    with urllib.request.urlopen(aq_req, timeout=4, context=ctx) as aq_resp:
+                    with _urlopen_resilient(aq_req, timeout=4) as aq_resp:
                         aq = json.loads(aq_resp.read().decode("utf-8")).get("current", {})
                     if aq.get("us_aqi") is not None:
                         aqi = int(round(aq["us_aqi"]))
@@ -755,9 +822,9 @@ class WeatherService(QObject):
 
                 self._last_data = payload
                 self._save_cache(payload)
-                self.weather_updated.emit(payload)
+                self._safe_emit_updated(payload)
         except Exception as e:
-            self.weather_failed.emit(str(e))
+            self._safe_emit_failed(str(e))
         finally:
             with self._lock:
                 self._is_updating = False
@@ -771,3 +838,8 @@ def get_weather_service() -> WeatherService:
     if _weather_service_instance is None:
         _weather_service_instance = WeatherService()
     return _weather_service_instance
+
+
+import sys as _sys  # noqa: E402
+_sys.modules.setdefault("weather_service", _sys.modules[__name__])
+_sys.modules.setdefault("stacky.services.weather_service", _sys.modules[__name__])

@@ -1,9 +1,12 @@
+import stacky.paths as _stacky_paths
 from stacky.paths import ROOT
 import os
 import sys
 import re
 import glob
+import struct
 import hashlib
+import threading
 from collections import OrderedDict
 import ctypes
 import winreg
@@ -11,9 +14,9 @@ from ctypes import wintypes
 from typing import Union, Optional, Tuple, List, Dict, Any
 from PySide6.QtGui import (
     QPixmap, QImage, QPainter, QColor, QFont, QPen, QBrush,
-    QLinearGradient, QRadialGradient, QPainterPath, QIcon
+    QLinearGradient, QRadialGradient, QPainterPath, QIcon, QGuiApplication
 )
-from PySide6.QtCore import Qt, QRectF, QRect, QPointF
+from PySide6.QtCore import Qt, QRectF, QRect, QPointF, QSize, QThread
 
 class SHFILEINFO(ctypes.Structure):
     _fields_ = [
@@ -42,12 +45,22 @@ SHIL_JUMBO = 0x4       # 256x256
 ILD_TRANSPARENT = 0x00000001
 
 def get_default_icon_cache_dir() -> str:
+    getter = getattr(_stacky_paths, "get_user_cache_dir", None)
+    if callable(getter):
+        try:
+            cache_dir = getter()
+            if cache_dir:
+                return cache_dir
+        except Exception:
+            pass
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        portable_flag = os.path.join(exe_dir, "portable.flag")
         portable_cache = os.path.join(exe_dir, ".cache_icons")
-        if os.path.exists(portable_cache) or os.access(exe_dir, os.W_OK):
+        if os.path.exists(portable_flag) or os.path.exists(portable_cache):
             return portable_cache
-        appdata_dir = os.path.join(os.environ.get("LOCALAPPDATA", exe_dir), "BigFolderLauncher")
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or exe_dir
+        appdata_dir = os.path.join(base, "Stacky")
         return os.path.join(appdata_dir, ".cache_icons")
     return os.path.join(ROOT, ".cache_icons")
 
@@ -64,6 +77,8 @@ def resolve_actual_path(file_path: str) -> str:
     """Expands environment variables, resolves common system paths, and auto-locates moved files on Desktop"""
     if not file_path:
         return ""
+    if file_path.lower().startswith(("http://", "https://", "steam://")):
+        return file_path
     expanded = os.path.expandvars(file_path)
     if os.path.exists(expanded):
         return expanded
@@ -91,24 +106,6 @@ def resolve_actual_path(file_path: str) -> str:
         return p2
 
     return expanded
-
-def resolve_url_shortcut(file_path: str) -> str:
-    """读取 .url 里的 URL 协议。
-
-    os.startfile(托管目录内的 .url 文件) 常常无反应，而 Explorer 双击同一个文件能打开；
-    把 URL 直接交给 ShellExecute 才与资源管理器行为一致（Steam / 网页快捷方式）。
-    """
-    if not file_path.lower().endswith(".url"):
-        return ""
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                s = line.strip()
-                if s.lower().startswith("url="):
-                    return s[4:].strip()
-    except Exception:
-        pass
-    return ""
 
 
 def resolve_shortcut_target(file_path: str) -> str:
@@ -1444,19 +1441,35 @@ def draw_bookmark_icon(url: str, title: str = "", size: int = 128) -> QPixmap:
 
 _IN_MEMORY_PIXMAP_CACHE = OrderedDict()
 _MAX_PIXMAP_CACHE_ENTRIES = 512
+_PIXMAP_CACHE_LOCK = threading.RLock()
+
+
+def _is_gui_thread() -> bool:
+    """Checks whether the caller is running on Qt's main GUI thread (QPixmap is GUI-thread-only in Qt6)."""
+    app = QGuiApplication.instance()
+    if app is None:
+        return False
+    return QThread.currentThread() == app.thread()
+
 
 def _store_in_memory_pixmap(key: str, pixmap: QPixmap):
     """Stores pixmap in L1 in-memory cache with LRU eviction to prevent unbounded memory growth."""
-    cache = _IN_MEMORY_PIXMAP_CACHE
-    if key in cache:
-        cache.move_to_end(key)
-    elif len(cache) >= _MAX_PIXMAP_CACHE_ENTRIES:
-        cache.popitem(last=False)
-    cache[key] = pixmap
+    if not _is_gui_thread():
+        return
+    with _PIXMAP_CACHE_LOCK:
+        cache = _IN_MEMORY_PIXMAP_CACHE
+        if key in cache:
+            cache.move_to_end(key)
+        elif len(cache) >= _MAX_PIXMAP_CACHE_ENTRIES:
+            cache.popitem(last=False)
+        cache[key] = pixmap
+
 
 def clear_in_memory_pixmap_cache():
     """Clears L1 in-memory pixmap cache to release GDI/GPU bitmap memory during idle state."""
-    _IN_MEMORY_PIXMAP_CACHE.clear()
+    with _PIXMAP_CACHE_LOCK:
+        _IN_MEMORY_PIXMAP_CACHE.clear()
+
 
 def get_app_icon_pixmap(file_path: str, display_name: str = "", target_size: int = 128, custom_icon_path: str = "") -> QPixmap:
     """
@@ -1464,11 +1477,15 @@ def get_app_icon_pixmap(file_path: str, display_name: str = "", target_size: int
     modern system-style icons for system utilities, and luxury squircle canvas harmonization.
     Features ultra-fast L1 in-memory caching to guarantee zero disk I/O during 60/120 FPS animations.
     """
+    if not _is_gui_thread():
+        return QPixmap()
+
     mem_key = f"{file_path}|{custom_icon_path}|{display_name}|{target_size}"
-    cached_mem = _IN_MEMORY_PIXMAP_CACHE.get(mem_key)
-    if cached_mem is not None and not cached_mem.isNull():
-        _IN_MEMORY_PIXMAP_CACHE.move_to_end(mem_key)
-        return cached_mem
+    with _PIXMAP_CACHE_LOCK:
+        cached_mem = _IN_MEMORY_PIXMAP_CACHE.get(mem_key)
+        if cached_mem is not None and not cached_mem.isNull():
+            _IN_MEMORY_PIXMAP_CACHE.move_to_end(mem_key)
+            return cached_mem
 
     ensure_cache_dir()
     real_path = resolve_actual_path(file_path)
@@ -1727,7 +1744,7 @@ def prewarm_icons_batch(items: list, target_size: int = 128):
     Prewarms a collection of items into L1 in-memory cache.
     Guarantees zero disk I/O when expanding folders with 40+ items for locked 120 FPS performance.
     """
-    if not items:
+    if not items or not _is_gui_thread():
         return
     for it in items:
         if not isinstance(it, dict):
@@ -1739,17 +1756,23 @@ def prewarm_icons_batch(items: list, target_size: int = 128):
             get_app_icon_pixmap(p, n, target_size=target_size, custom_icon_path=c)
 
 
-def get_ui_chevron_icon_path(hover: bool = False) -> str:
+def get_ui_chevron_icon_path(hover: bool = False, light: bool = False) -> str:
     """返回用于 QComboBox / 折叠菜单的高清抗锯齿向下箭头图标路径 (规避 Win32 原生黑方块与CSS三角形瑕疵)"""
     ensure_cache_dir()
-    fname = "ui_chevron_down_hover.png" if hover else "ui_chevron_down.png"
+    if light:
+        fname = "ui_chevron_down_light_hover.png" if hover else "ui_chevron_down_light.png"
+    else:
+        fname = "ui_chevron_down_hover.png" if hover else "ui_chevron_down.png"
     fpath = os.path.join(CACHE_DIR, fname)
     if not os.path.exists(fpath):
         img = QImage(16, 16, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        color = QColor(255, 255, 255, 240) if hover else QColor(148, 163, 184, 200)
+        if light:
+            color = QColor(15, 23, 42, 235) if hover else QColor(71, 85, 105, 210)
+        else:
+            color = QColor(255, 255, 255, 240) if hover else QColor(148, 163, 184, 200)
         pen = QPen(color, 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -1797,4 +1820,231 @@ def draw_liquid_glass(painter, path, rect, radius, theme="dark"):
     painter.strokePath(path, QPen(QColor(255, 255, 255, hi), 1.0))
     inner = create_squircle_path(rect.adjusted(2, 2, -2, -2), max(2.0, radius - 2.0))
     painter.strokePath(inner, QPen(QColor(0, 0, 0, 22), 0.7))
+
+
+def render_squircle_card_with_shadow(
+    canvas_size: QSize,
+    card_rect: QRectF,
+    radius: float,
+    opacity: float = 0.88,
+    theme: str = "dark",
+    draw_shadow: bool = True,
+    dpr: float = 1.0,
+) -> QPixmap:
+    """离屏渲染统一超椭圆玻璃底板与缕空接触阴影（DestinationOut），原生支持小数倍率 HiDPI。
+
+    - 外部阴影由多阶同心超椭圆环境层 + 贴边接触层叠加，严格收在画布留白内，
+      四角与外框边缘 alpha 恒为 0，杜绝矩形裁切黑边；
+    - 使用 DestinationOut 将卡片内部阴影 100% 挖空，半透明玻璃内部零发灰变脏；
+    - 按物理像素分辨率 (w * dpr, h * dpr) 分配 QImage 并在绘制前设置 setDevicePixelRatio(dpr)，
+      保证 125% / 150% / 175% / 200% PassThrough 缩放下超椭圆边缘与阴影像素级锐利；
+    - 统一大文件夹卡片与桌面小组件的深色 / 浅色 / 纯黑玻璃色温与液态折射光学层。
+    """
+    w = int(canvas_size.width())
+    h = int(canvas_size.height())
+    if w <= 0 or h <= 0:
+        return QPixmap()
+
+    dpr = max(1.0, float(dpr or 1.0))
+    phys_w = max(1, int(round(w * dpr)))
+    phys_h = max(1, int(round(h * dpr)))
+
+    img = QImage(phys_w, phys_h, QImage.Format.Format_ARGB32_Premultiplied)
+    img.setDevicePixelRatio(dpr)
+    img.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    rect = QRectF(card_rect)
+    r = float(radius)
+    theme_key = (theme or "dark").strip().lower()
+    op = max(0.05, min(1.0, float(opacity)))
+    card_path = create_squircle_path(rect, r)
+
+    min_margin = min(
+        float(rect.left()),
+        float(rect.top()),
+        float(w) - float(rect.right()),
+        float(h) - float(rect.bottom()),
+    )
+
+    if draw_shadow and min_margin >= 6.0:
+        safe_room = max(2.0, min_margin - 2.0)
+        max_spread = min(16.0, safe_room * 0.78)
+        max_dy = min(4.0, max(0.0, safe_room - max_spread))
+        is_light = theme_key == "light"
+        base_rgb = (15, 23, 42) if is_light else (0, 0, 0)
+        # (spread_ratio, dy_ratio, dark_alpha, light_alpha)
+        rings = (
+            (1.00, 1.00, 5, 3),
+            (0.76, 0.82, 8, 4),
+            (0.56, 0.65, 11, 6),
+            (0.38, 0.48, 15, 8),
+            (0.22, 0.32, 20, 11),
+            (0.09, 0.16, 26, 14),
+        )
+        p.setPen(Qt.PenStyle.NoPen)
+        for s_frac, dy_frac, a_dark, a_light in rings:
+            sp = max_spread * s_frac
+            dy = max_dy * dy_frac
+            alpha = a_light if is_light else a_dark
+            s_rect = rect.adjusted(-sp, -sp * 0.72 + dy, sp, sp + dy)
+            s_path = create_squircle_path(s_rect, r + sp * 0.85)
+            p.fillPath(s_path, QColor(base_rgb[0], base_rgb[1], base_rgb[2], alpha))
+
+        # 彻底挖空卡片内部阴影，防止半透明玻璃被底层阴影染脏
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
+        p.fillPath(card_path, QColor(0, 0, 0, 255))
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+    grad = QLinearGradient(rect.left(), rect.top(), rect.left(), rect.bottom())
+    if theme_key == "light":
+        grad.setColorAt(0.0, QColor(250, 251, 253, int(round(165 * op))))
+        grad.setColorAt(1.0, QColor(236, 239, 244, int(round(158 * op))))
+    elif theme_key == "oled":
+        grad.setColorAt(0.0, QColor(18, 19, 23, int(round(162 * op))))
+        grad.setColorAt(1.0, QColor(8, 9, 11, int(round(168 * op))))
+    else:
+        grad.setColorAt(0.0, QColor(38, 41, 48, int(round(158 * op))))
+        grad.setColorAt(1.0, QColor(24, 26, 31, int(round(164 * op))))
+
+    p.fillPath(card_path, grad)
+    draw_liquid_glass(p, card_path, rect, r, theme_key)
+    if theme_key == "light":
+        p.strokePath(card_path, QPen(QColor(15, 23, 42, 24), 0.8))
+
+    p.end()
+    pm = QPixmap.fromImage(img)
+    pm.setDevicePixelRatio(dpr)
+    return pm
+
+
+_KNOWN_ADMIN_EXES = frozenset({"regedit.exe", "taskmgr.exe", "mmc.exe", "dism++.exe"})
+_LNK_ADMIN_CACHE: "OrderedDict[Tuple[str, float], bool]" = OrderedDict()
+_MAX_LNK_ADMIN_CACHE = 512
+_LNK_ADMIN_CACHE_LOCK = threading.RLock()
+_SHLLINK_HEADER_SIZE = 0x0000004C
+_SHLLINK_HAS_RUN_AS_ADMIN = 0x00002000
+
+
+def has_lnk_run_as_admin(file_path: str) -> bool:
+    """检测目标程序或 .lnk 快捷方式是否标记了管理员权限（HasRunAsAdmin = 0x2000）。"""
+    if not file_path:
+        return False
+    clean = str(file_path).strip().strip('"')
+    if not clean or clean.lower().startswith(("http://", "https://", "steam://")):
+        return False
+
+    if os.path.basename(clean).lower() in _KNOWN_ADMIN_EXES:
+        return True
+
+    real_path = resolve_actual_path(clean)
+    if os.path.basename(real_path).lower() in _KNOWN_ADMIN_EXES:
+        return True
+
+    if real_path.lower().endswith(".lnk") and os.path.isfile(real_path):
+        try:
+            st = os.stat(real_path)
+            mtime = float(st.st_mtime)
+            fsize = int(st.st_size)
+        except OSError:
+            return False
+
+        cache_key = (os.path.normcase(os.path.abspath(real_path)), mtime)
+        with _LNK_ADMIN_CACHE_LOCK:
+            cached = _LNK_ADMIN_CACHE.get(cache_key)
+            if cached is not None:
+                _LNK_ADMIN_CACHE.move_to_end(cache_key)
+                return cached
+
+        is_admin = False
+        try:
+            with open(real_path, "rb") as f:
+                header = f.read(76)
+            if len(header) >= 76:
+                hdr_size, = struct.unpack_from("<I", header, 0)
+                link_flags, = struct.unpack_from("<I", header, 0x14)
+                if hdr_size == _SHLLINK_HEADER_SIZE and (link_flags & _SHLLINK_HAS_RUN_AS_ADMIN):
+                    is_admin = True
+        except Exception:
+            is_admin = False
+
+        if not is_admin and fsize > 76:
+            target = resolve_shortcut_target(real_path)
+            if target and os.path.basename(target).lower() in _KNOWN_ADMIN_EXES:
+                is_admin = True
+
+        with _LNK_ADMIN_CACHE_LOCK:
+            if len(_LNK_ADMIN_CACHE) >= _MAX_LNK_ADMIN_CACHE:
+                _LNK_ADMIN_CACHE.popitem(last=False)
+            _LNK_ADMIN_CACHE[cache_key] = is_admin
+        return is_admin
+
+    return False
+
+
+def draw_admin_shield_badge(painter: QPainter, badge_rect: QRectF):
+    """在指定矩形内绘制高清晰度双色矢量 UAC 盾牌角标（蓝金四象限纹章 + 白边描边）。"""
+    r = QRectF(badge_rect)
+    w = float(r.width())
+    h = float(r.height())
+    if w <= 1.0 or h <= 1.0:
+        return
+
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    cx = r.center().x()
+    top = r.top() + h * 0.06
+    bot = r.bottom() - h * 0.05
+    left = r.left() + w * 0.10
+    right = r.right() - w * 0.10
+    shoulder_y = r.top() + h * 0.19
+    mid_y = r.top() + h * 0.52
+
+    shield = QPainterPath()
+    shield.moveTo(cx, top)
+    shield.lineTo(right, shoulder_y)
+    shield.cubicTo(right, mid_y, cx + w * 0.28, r.top() + h * 0.80, cx, bot)
+    shield.cubicTo(cx - w * 0.28, r.top() + h * 0.80, left, mid_y, left, shoulder_y)
+    shield.closeSubpath()
+
+    # 柔和接触底影，保证在亮色/纯白应用图标上同样锐利分明
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.fillPath(shield.translated(0.0, max(0.6, h * 0.05)), QColor(0, 0, 0, 95))
+
+    # 双色四象限填充（Windows 11 UAC 经典蓝金对角盾牌）
+    painter.save()
+    painter.setClipPath(shield)
+    split_y = r.top() + h * 0.48
+
+    blue_grad = QLinearGradient(r.left(), top, r.right(), bot)
+    blue_grad.setColorAt(0.0, QColor("#3b82f6"))
+    blue_grad.setColorAt(1.0, QColor("#1d4ed8"))
+
+    gold_grad = QLinearGradient(r.left(), top, r.right(), bot)
+    gold_grad.setColorAt(0.0, QColor("#fbbf24"))
+    gold_grad.setColorAt(1.0, QColor("#d97706"))
+
+    painter.fillRect(QRectF(r.left(), r.top(), cx - r.left(), split_y - r.top()), blue_grad)
+    painter.fillRect(QRectF(cx, r.top(), r.right() - cx, split_y - r.top()), gold_grad)
+    painter.fillRect(QRectF(r.left(), split_y, cx - r.left(), r.bottom() - split_y), gold_grad)
+    painter.fillRect(QRectF(cx, split_y, r.right() - cx, r.bottom() - split_y), blue_grad)
+
+    gloss = QLinearGradient(0.0, top, 0.0, split_y)
+    gloss.setColorAt(0.0, QColor(255, 255, 255, 80))
+    gloss.setColorAt(1.0, QColor(255, 255, 255, 0))
+    painter.fillRect(QRectF(r.left(), top, w, split_y - top), gloss)
+    painter.restore()
+
+    border_pen = QPen(QColor(255, 255, 255, 232), max(0.9, min(w, h) * 0.075))
+    border_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.strokePath(shield, border_pen)
+    painter.restore()
+
+
+sys.modules.setdefault("icon_utils", sys.modules[__name__])
+sys.modules.setdefault("stacky.ui.icon_utils", sys.modules[__name__])
+
 

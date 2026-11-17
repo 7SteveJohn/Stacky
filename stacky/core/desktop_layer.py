@@ -48,6 +48,12 @@ HTCLIENT = 1
 WINEVENT_OUTOFCONTEXT = 0x0000
 EVENT_SYSTEM_FOREGROUND = 0x0003
 
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+SMTO_ABORTIFHUNG = 0x0002
+
 dwmapi = ctypes.windll.dwmapi if sys.platform == "win32" else None
 DWMWA_CLOAKED = 14
 
@@ -66,6 +72,13 @@ if user32:
     user32.GetWindowLongW.restype = ctypes.c_long
     user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
     user32.SetWindowLongW.restype = ctypes.c_long
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        if hasattr(user32, "SetWindowLongPtrW"):
+            user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+        if hasattr(user32, "GetWindowLongPtrW"):
+            user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.SetWindowPos.argtypes = [
         wintypes.HWND, wintypes.HWND,
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -121,6 +134,15 @@ if user32:
     user32.ScreenToClient.restype = wintypes.BOOL
     user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     user32.SendMessageW.restype = wintypes.LPARAM
+    user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.c_void_p
+    ]
+    user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
     user32.GetDoubleClickTime.argtypes = []
     user32.GetDoubleClickTime.restype = wintypes.UINT
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
@@ -138,26 +160,18 @@ def set_window_long_ptr(hwnd: int, index: int, new_long: int) -> int:
     """Sets a window pointer or long value safely on both 32-bit and 64-bit systems."""
     if not user32 or not hwnd:
         return 0
-    if ctypes.sizeof(ctypes.c_void_p) == 8:
-        set_ptr = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
-        set_ptr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
-        set_ptr.restype = ctypes.c_ssize_t
-        return set_ptr(hwnd, index, new_long)
-    else:
-        return user32.SetWindowLongW(hwnd, index, new_long)
+    if ctypes.sizeof(ctypes.c_void_p) == 8 and hasattr(user32, "SetWindowLongPtrW"):
+        return user32.SetWindowLongPtrW(hwnd, index, new_long)
+    return user32.SetWindowLongW(hwnd, index, new_long)
 
 
 def get_window_long_ptr(hwnd: int, index: int) -> int:
     """Gets a window pointer or long value safely on both 32-bit and 64-bit systems."""
     if not user32 or not hwnd:
         return 0
-    if ctypes.sizeof(ctypes.c_void_p) == 8:
-        get_ptr = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
-        get_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
-        get_ptr.restype = ctypes.c_ssize_t
-        return get_ptr(hwnd, index)
-    else:
-        return user32.GetWindowLongW(hwnd, index)
+    if ctypes.sizeof(ctypes.c_void_p) == 8 and hasattr(user32, "GetWindowLongPtrW"):
+        return user32.GetWindowLongPtrW(hwnd, index)
+    return user32.GetWindowLongW(hwnd, index)
 
 
 def find_desktop_shell_window() -> Tuple[int, int]:
@@ -230,6 +244,15 @@ WinEventProcType = ctypes.WINFUNCTYPE(
     wintypes.DWORD,
     wintypes.DWORD
 ) if user32 else None
+
+if user32 and WinEventProcType:
+    user32.SetWinEventHook.argtypes = [
+        wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+        WinEventProcType, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD
+    ]
+    user32.SetWinEventHook.restype = wintypes.HANDLE
+    user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+    user32.UnhookWinEvent.restype = wintypes.BOOL
 
 
 def is_window_cloaked(hwnd: int) -> bool:
@@ -378,6 +401,81 @@ def pin_to_desktop(hwnd: int, shell_hwnd: int = 0) -> bool:
     return True
 
 
+class _ForegroundHookHub:
+    """
+    Process-wide shared EVENT_SYSTEM_FOREGROUND WinEventHook dispatcher.
+    Installs ONE native SetWinEventHook when the first DesktopWatchdog registers,
+    fans out foreground change notifications to all active watchdogs, and calls
+    UnhookWinEvent cleanly when the last watchdog stops.
+    """
+
+    def __init__(self):
+        self._watchdogs: list = []
+        self._hook = None
+        self._hook_proc = None
+
+    @property
+    def hook_handle(self):
+        return self._hook
+
+    @property
+    def active_count(self) -> int:
+        return len(self._watchdogs)
+
+    def register(self, watchdog: 'DesktopWatchdog'):
+        if watchdog not in self._watchdogs:
+            self._watchdogs.append(watchdog)
+        if self._hook is None and self._watchdogs and user32 and WinEventProcType:
+            self._install_hook()
+
+    def unregister(self, watchdog: 'DesktopWatchdog'):
+        if watchdog in self._watchdogs:
+            self._watchdogs.remove(watchdog)
+        if not self._watchdogs:
+            self._uninstall_hook()
+
+    def _install_hook(self):
+        if self._hook is not None or not user32 or not WinEventProcType:
+            return
+
+        def _proc(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+            self._dispatch(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime)
+
+        self._hook_proc = WinEventProcType(_proc)
+        try:
+            self._hook = user32.SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                None,
+                self._hook_proc,
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT
+            )
+        except Exception:
+            self._hook = None
+            self._hook_proc = None
+
+    def _uninstall_hook(self):
+        if self._hook is not None and user32:
+            try:
+                user32.UnhookWinEvent(self._hook)
+            except Exception:
+                pass
+        self._hook = None
+        self._hook_proc = None
+
+    def _dispatch(self, hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+        for wd in list(self._watchdogs):
+            try:
+                wd._on_winevent(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime)
+            except Exception:
+                pass
+
+
+_FOREGROUND_HOOK_HUB = _ForegroundHookHub()
+
+
 class DesktopWatchdog(QObject):
     """
     High-performance, ultra-lightweight Z-Order Watchdog and TemporaryRaise Lease Manager.
@@ -413,85 +511,107 @@ class DesktopWatchdog(QObject):
         self.watchdog_timer.timeout.connect(self.check_health)
         self.watchdog_timer.start()
 
-        # Event Hook for zero-polling desktop foreground shifts
-        self._hook = None
-        self._hook_proc = None
-        if user32 and WinEventProcType:
-            def _on_winevent(hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
-                try:
-                    if not getattr(self, "enabled", False) or not self.target_widget:
-                        return
-
-                    try:
-                        my_hwnd = int(self.target_widget.winId())
-                    except Exception:
-                        my_hwnd = 0
-
-                    fg = user32.GetForegroundWindow() if hasattr(user32, "GetForegroundWindow") else 0
-                    if not fg:
-                        return
-
-                    buf = (wintypes.WCHAR * 256)()
-                    user32.GetClassNameW(fg, buf, 256)
-                    cls_name = buf.value
-
-                    is_shell = cls_name in ("Progman", "WorkerW", "SHELLDLL_DefView")
-                    is_my_win = (fg == my_hwnd)
-
-                    # If user switched to an external app (fullscreen game/app, browser, IDE, video player, etc.):
-                    if not is_my_win and not is_shell:
-                        # Immediately release any lingering elevation and re-bed down to HWND_BOTTOM!
-                        if getattr(self, "is_elevated", False) or getattr(self, "is_summon_elevated", False):
-                            self.is_elevated = False
-                            self.is_summon_elevated = False
-                            self.active_lease_reason = ""
-                            self.lease_timer.stop()
-                        self.re_bed()
-                        return
-                    elif is_shell:
-                        # Desktop shell focused (Win+D or clicked empty wallpaper)
-                        self.re_bed()
-                        return
-
-                    # Asynchronously verify desktop bedding on foreground shift
-                    QTimer.singleShot(60, self.check_health)
-                except Exception:
-                    pass
-
-            self._hook_proc = WinEventProcType(_on_winevent)
-            try:
-                self._hook = user32.SetWinEventHook(
-                    EVENT_SYSTEM_FOREGROUND,
-                    EVENT_SYSTEM_FOREGROUND,
-                    None,
-                    self._hook_proc,
-                    0,
-                    0,
-                    WINEVENT_OUTOFCONTEXT
-                )
-            except Exception:
-                self._hook = None
+        # Register with process-wide shared WinEventHook hub (1 hook per process instead of N)
+        _FOREGROUND_HOOK_HUB.register(self)
 
         self._refresh_shell_handles()
 
+    @property
+    def _hook(self):
+        return _FOREGROUND_HOOK_HUB.hook_handle if self in _FOREGROUND_HOOK_HUB._watchdogs else None
+
+    def _on_winevent(self, hHook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+        try:
+            if not getattr(self, "enabled", False) or not self.target_widget:
+                return
+
+            try:
+                my_hwnd = int(self.target_widget.winId())
+            except Exception:
+                my_hwnd = 0
+
+            fg = user32.GetForegroundWindow() if (user32 and hasattr(user32, "GetForegroundWindow")) else 0
+            if not fg:
+                return
+
+            buf = (wintypes.WCHAR * 256)()
+            user32.GetClassNameW(fg, buf, 256)
+            cls_name = buf.value
+
+            is_shell = cls_name in ("Progman", "WorkerW", "SHELLDLL_DefView")
+            is_my_win = (fg == my_hwnd)
+
+            pid_buf = wintypes.DWORD(0)
+            if user32 and hasattr(user32, "GetWindowThreadProcessId"):
+                user32.GetWindowThreadProcessId(fg, ctypes.byref(pid_buf))
+            is_my_process = (pid_buf.value == os.getpid()) if pid_buf.value else False
+
+            if is_shell:
+                # Desktop shell focused (Win+D or clicked empty wallpaper)
+                was_elevated = bool(getattr(self, "is_elevated", False) or getattr(self, "is_summon_elevated", False))
+                if was_elevated:
+                    self._sync_revoked_summon_state()
+                self.re_bed()
+                if was_elevated:
+                    self.elevation_changed.emit(False)
+                return
+
+            # Same-process sibling card, drawer, context menu, or SettingsDialog:
+            # do NOT treat as external app stealing foreground and avoid Z-order thrashing!
+            if is_my_win or is_my_process:
+                if is_my_win and not getattr(self, "is_elevated", False) and not getattr(self, "is_summon_elevated", False):
+                    QTimer.singleShot(60, self.check_health)
+                return
+
+            # External app (fullscreen game/app, browser, IDE, video player, etc.) took foreground:
+            was_elevated = bool(getattr(self, "is_elevated", False) or getattr(self, "is_summon_elevated", False))
+            if was_elevated:
+                self._sync_revoked_summon_state()
+            self.re_bed()
+            if was_elevated:
+                self.elevation_changed.emit(False)
+        except Exception:
+            pass
+
+    def _sync_revoked_summon_state(self):
+        """Keeps target_widget.is_summoned_front synchronized when watchdog revokes summon elevation."""
+        was_summon = bool(getattr(self, "is_summon_elevated", False))
+        self.is_elevated = False
+        self.is_summon_elevated = False
+        self.active_lease_reason = ""
+        self.lease_timer.stop()
+        target = self.target_widget
+        if was_summon and target is not None and getattr(target, "is_summoned_front", False):
+            target.is_summoned_front = False
+            saved_pos = getattr(target, "_summon_saved_pos", None)
+            if saved_pos is not None:
+                try:
+                    target.move(saved_pos)
+                except Exception:
+                    pass
+                target._summon_saved_pos = None
+            toast = getattr(target, "toast", None)
+            if toast is not None:
+                try:
+                    toast.hide()
+                except Exception:
+                    pass
+
     def start(self):
         """Starts the watchdog."""
+        if self.target_widget is not None:
+            self.enabled = True
+            _FOREGROUND_HOOK_HUB.register(self)
         if not self.watchdog_timer.isActive():
             self.watchdog_timer.start()
         self.re_bed()
 
     def stop(self):
-        """Stops the watchdog."""
+        """Stops the watchdog and unregisters from the shared foreground hook hub."""
         self.enabled = False
         self.watchdog_timer.stop()
         self.lease_timer.stop()
-        if self._hook and user32:
-            try:
-                user32.UnhookWinEvent(self._hook)
-            except Exception:
-                pass
-            self._hook = None
-        self._hook_proc = None
+        _FOREGROUND_HOOK_HUB.unregister(self)
         self.target_widget = None
 
     def set_enabled(self, enabled: bool):
@@ -698,15 +818,18 @@ class DesktopWatchdog(QObject):
             except Exception:
                 my_hwnd = 0
             if fg and fg != my_hwnd:
-                buf = (wintypes.WCHAR * 256)()
-                user32.GetClassNameW(fg, buf, 256)
-                if buf.value not in ("Progman", "WorkerW", "SHELLDLL_DefView"):
-                    # External application is in foreground: revoke elevation and re-bed
-                    self.is_elevated = False
-                    self.is_summon_elevated = False
-                    self.active_lease_reason = ""
-                    self.lease_timer.stop()
-                    self.re_bed()
+                pid_buf = wintypes.DWORD(0)
+                if hasattr(user32, "GetWindowThreadProcessId"):
+                    user32.GetWindowThreadProcessId(fg, ctypes.byref(pid_buf))
+                is_my_process = (pid_buf.value == os.getpid()) if pid_buf.value else False
+                if not is_my_process:
+                    buf = (wintypes.WCHAR * 256)()
+                    user32.GetClassNameW(fg, buf, 256)
+                    if buf.value not in ("Progman", "WorkerW", "SHELLDLL_DefView"):
+                        # External application is in foreground: revoke elevation and re-bed
+                        self._sync_revoked_summon_state()
+                        self.re_bed()
+                        self.elevation_changed.emit(False)
             return
 
         # If minimized (Win+D / Win+M), restore and re-bed immediately
@@ -788,15 +911,22 @@ def is_point_on_desktop_blank(pt_x: int, pt_y: int) -> bool:
     判断指定屏幕像素点是否处于 Windows 桌面壁纸层 (DefView / SysListView32) 的纯空白区域。
     - 若命中外部应用程序窗口、启动台卡片或桌面应用图标，返回 False
     - 仅在点击纯壁纸背景或无图标空白区域时返回 True
-    - 采用 IAccessible 高速原生无损命中检测 (0ms 延迟，零跨进程内存阻塞，杜绝低级鼠标钩子超时被撤销)
+    - 支持多显示器虚拟桌面坐标（含负 X/Y 副屏与右侧副屏）
+    - 访问 Explorer SysListView32 前先做 60ms SMTO_ABORTIFHUNG 存活探测，杜绝 Explorer 假死冻结 UI
     """
     if not user32:
         return False
     try:
-        # 1. 屏幕物理边界有效性防越界
-        screen_w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-        screen_h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-        if pt_x < 0 or pt_y < 0 or pt_x >= screen_w or pt_y >= screen_h:
+        # 1. 多显示器虚拟桌面边界防越界（兼容负坐标副屏与主屏外副屏）
+        vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        if vw <= 0 or vh <= 0:
+            vx, vy = 0, 0
+            vw = user32.GetSystemMetrics(0)
+            vh = user32.GetSystemMetrics(1)
+        if pt_x < vx or pt_y < vy or pt_x >= vx + vw or pt_y >= vy + vh:
             return False
 
         pt = POINT(pt_x, pt_y)
@@ -820,6 +950,14 @@ def is_point_on_desktop_blank(pt_x: int, pt_y: int) -> bool:
         if cls_name == "SysListView32":
             parent = user32.GetParent(hwnd)
             if parent == defview or user32.FindWindowExW(defview, 0, "SysListView32", None) == hwnd:
+                # 跨进程调用 AccessibleObjectFromWindow 前先探测 Explorer 消息循环是否存活 (60ms 超时)
+                if hasattr(user32, "SendMessageTimeoutW"):
+                    dummy = ctypes.c_size_t(0)
+                    alive = user32.SendMessageTimeoutW(
+                        hwnd, 0, 0, 0, SMTO_ABORTIFHUNG, 60, ctypes.byref(dummy)
+                    )
+                    if not alive:
+                        return False
                 if oleacc and _AccHitTestType:
                     try:
                         pacc = ctypes.c_void_p()
@@ -935,4 +1073,8 @@ class DesktopBlankDoubleClickHandler(QObject):
     def trigger_simulated_double_click(self):
         """用于自动化测试模拟双击桌面空白"""
         self.desktop_blank_double_clicked.emit()
+
+
+sys.modules.setdefault("desktop_layer", sys.modules[__name__])
+sys.modules.setdefault("stacky.core.desktop_layer", sys.modules[__name__])
 

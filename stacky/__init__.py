@@ -10,6 +10,8 @@
 import os
 import sys
 
+__version__ = "1.0.3"
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SUBDIRS = ("core", "widgets", "media", "services", "ui", "utils")
 
